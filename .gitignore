@@ -6,3 +6,4 @@ local.properties
 .idea/
 .local/
 *.iml
+/release-output/

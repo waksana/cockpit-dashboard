@@ -1,5 +1,13 @@
 plugins { id 'com.android.application' }
 
+def releaseCode = providers.environmentVariable('DASHBOARD_VERSION_CODE').getOrElse('10000')
+def releaseName = providers.environmentVariable('DASHBOARD_VERSION_NAME').getOrElse('0.3.0')
+if (!(releaseCode ==~ /[1-9][0-9]{0,8}/) || !(releaseName ==~ /[0-9]+\.[0-9]+\.[0-9]+/)) {
+    throw new GradleException('Invalid release version configuration')
+}
+def signingValues = ['DASHBOARD_KEYSTORE', 'DASHBOARD_STORE_PASSWORD', 'DASHBOARD_KEY_ALIAS', 'DASHBOARD_KEY_PASSWORD']
+        .collectEntries { [(it): providers.environmentVariable(it).orNull] }
+
 android {
     namespace 'io.github.waksana.cockpitdashboard'
     compileSdk 35
@@ -7,9 +15,25 @@ android {
         applicationId 'io.github.waksana.cockpitdashboard'
         minSdk 23
         targetSdk 35
-        versionCode 2
-        versionName '0.2.0-passkey-trial'
+        versionCode releaseCode.toInteger()
+        versionName releaseName
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+    }
+    signingConfigs {
+        release {
+            if (signingValues.values().every { it }) {
+                storeFile file(signingValues.DASHBOARD_KEYSTORE)
+                storePassword signingValues.DASHBOARD_STORE_PASSWORD
+                keyAlias signingValues.DASHBOARD_KEY_ALIAS
+                keyPassword signingValues.DASHBOARD_KEY_PASSWORD
+            }
+        }
+    }
+    buildTypes {
+        release {
+            signingConfig signingConfigs.release
+            minifyEnabled false
+        }
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
@@ -17,6 +41,17 @@ android {
     }
     testOptions { unitTests.includeAndroidResources = true }
     lint { abortOnError true }
+}
+
+tasks.register('requireReleaseSigning') {
+    doLast {
+        if (!signingValues.values().every { it }) {
+            throw new GradleException('Release signing is not configured; all DASHBOARD signing variables are required')
+        }
+    }
+}
+tasks.configureEach {
+    if (name == 'preReleaseBuild') dependsOn 'requireReleaseSigning'
 }
 
 dependencies {

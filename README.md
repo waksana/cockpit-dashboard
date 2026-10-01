@@ -17,7 +17,7 @@ answer mode is involved.
 | Left | Send an available draft once to the configured session. |
 | Right | Discard this draft/recording, not an already accepted task. |
 | Up / down | Scroll chat. At the top, another up press loads older history. |
-| Back / menu | Return, reconnect, connection settings or exit. |
+| Back / menu | Return, reconnect, choose a session, advanced settings or exit. |
 
 The same input answers the session's current native `ask` when one was present
 at recording start. The original request identity is retained through preview.
@@ -41,20 +41,33 @@ be sent. Right cancellation cannot undo already incurred Azure processing/cost.
 * A reachable **authenticated HTTPS gateway** in front of Cockpit, with a
   normally trusted certificate. HTTP and certificate-verification bypasses
   are deliberately unsupported.
-* One existing ordinary session. Configure its ID from the Cockpit session URL.
+* An existing session chosen from the session directory using the remote.
   The app neither creates nor manages sessions.
 * The existing `cockpit-speech` module configured by its operator for Azure
   OpenAI transcription. No Google recognition service is required.
 
-On first launch, enter the HTTPS root URL, session ID and, if applicable, the
-gateway's `Authorization` value (`Basic ...` or `Bearer ...`). This is **not**
-the GitHub/Copilot token. Alternatively choose **Save and sign in with Passkey**
-for the opt-in native trial described below. Do not expose an unauthenticated
-Cockpit port to work around a missing credential provider or gateway setup.
+On first launch enter your Cockpit hostname once, such as `cockpit.example.com`.
+The app defaults to HTTPS and saves the address locally; no personal host is
+bundled in the source or APK. Select **Save and sign in with Passkey**, then use
+up/down and confirm on the remote to select a session. No session ID typing is
+required. The directory includes all sessions
+regardless of role, loaded state or status; it does not auto-select an Assistant
+session. Titles, working directories and IDs distinguish similarly named entries.
+Next/previous page controls expose the full directory in bounded pages. Listing
+does not load sessions or read their chats. A changed catalog invalidates its
+cursor; explicitly refresh rather than silently skipping entries.
+
+The selected session and login are saved encrypted and reused after restarting.
+Use **Choose session** in the menu to change it. Resolve/discard a draft or an
+uncertain send before switching; old text must never move to another destination.
+**Advanced connection settings** optionally changes the HTTPS root and gateway
+`Authorization` (`Basic ...` or `Bearer ...`, not the GitHub/Copilot token).
+Changing the site clears the old selection and cookie. Do not expose an
+unauthenticated Cockpit port to bypass missing provider or gateway setup.
 
 Settings and retained draft/uncertain-send state are encrypted with an
 Android Keystore AES-GCM key. Android backup and screenshots are disabled.
-Speech's Azure credentials are short-lived and kept in memory. No service
+Speech's Azure credentials are short-lived and kept in memory. No personal service
 URL, real credential, transcript or recording is bundled in the APK.
 
 USB presence alone is insufficient: capture must actually route to the selected
@@ -147,12 +160,77 @@ distribution checksum:
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Version `0.2.0-passkey-trial` / version code `2`, application ID
-`io.github.waksana.cockpitdashboard`. The output is a **debug-signed sideload
-APK**, not a store release or a user-signed production build. It appears in
-both ordinary and TV launchers. A different debug signing key may require
-uninstalling an older build, which removes local configuration/drafts.
-CI uploads a debug APK artifact, without publishing a tag or GitHub Release.
+The local default is version `0.3.0` / version code `10000`, application ID
+`io.github.waksana.cockpitdashboard`. It appears in ordinary and TV launchers.
+The command above produces a **debug** APK for development, not an update for
+the release-signed app. The first switch from an earlier debug trial to the
+independent release signer requires uninstalling the old app. This deletes its
+local login, settings and drafts; inspect uncertain sends in Cockpit first.
+Subsequent same-signer updates preserve app data, subject to server login expiry.
+
+## Signed updates and release operations
+
+The app checks the repository's latest stable GitHub Release once per activity
+launch; **Check app updates** in the menu explicitly retries. New-version prompts
+wait until the app is foreground and not recording, sending, logging in or showing
+another dialog. Downloads are private and cancelled on leaving the activity.
+The updater accepts only the canonical `cockpit-dashboard.apk` and `update.json`
+assets. It validates bounded sizes, SHA-256, package name, increasing integer
+version code, version name, minimum SDK and the exact installed single signing
+certificate. Signing rotation and downgrades are not supported. Public GitHub
+traffic has a separate client and carries no Cockpit credentials.
+
+Confirm downloading, then confirm opening Android's installer. Android 8+ may
+first require allowing this app to install unknown apps; returning from settings
+still requires confirmation. This is not a silent installer and an installer
+launch is not proof that installation succeeded. Firmware without a usable
+installer needs manual sideloading. No APK Release exists merely because this
+workflow source is present.
+
+`.github/workflows/android.yml` tests/lints/builds PRs without signing secrets.
+Future pushes to `main` additionally build a signed release after those checks.
+The version is `0.3.<github.run_number>`, code `10000 + github.run_number`; do not
+reset this workflow's numbering or manually publish conflicting versions.
+Publication is serialized, refuses obsolete main commits and never overwrites
+an existing release. It first uploads both assets to a draft and then publishes
+it as latest. A failed draft or existing tag requires operator inspection, not
+blind rerunning or overwriting assets. A newer main push produces a new version.
+
+Before enabling publication, the operator must back up the **existing release
+keystore** and password securely, and configure repository Actions Secrets:
+
+| Secret | Value |
+| --- | --- |
+| `DASHBOARD_KEYSTORE_BASE64` | Base64 bytes of the existing release keystore |
+| `DASHBOARD_STORE_PASSWORD` | Its store password |
+| `DASHBOARD_KEY_ALIAS` | Its signing alias (`dashboard` for the initial signer) |
+| `DASHBOARD_KEY_PASSWORD` | Its private-key password |
+
+Never generate a replacement key for each build. `release-signing.sha256` pins
+the public certificate hash; `scripts/release-metadata.mjs` independently verifies
+the signed APK before producing release assets. Missing secrets or a different
+certificate fail publishing, rather than falling back to unsigned/debug output.
+Private keys/passwords must never enter commits, logs, artifacts or Releases.
+This delivery does not configure Secrets, merge, create a Release or deploy.
+
+For a local release, set `DASHBOARD_KEYSTORE` to the protected keystore path and
+the three password/alias environment variables above, then run:
+
+```sh
+./gradlew --no-daemon assembleRelease
+mkdir -p release-output
+DASHBOARD_VERSION_CODE=10000 DASHBOARD_VERSION_NAME=0.3.0 \
+  node scripts/release-metadata.mjs app/build/outputs/apk/release/app-release.apk \
+  "$ANDROID_HOME/build-tools/35.0.0/aapt" "$ANDROID_HOME/build-tools/35.0.0/apksigner" release-output
+```
+
+The initial release signing certificate SHA-256 is:
+`4B:EF:7D:18:2C:F4:62:39:10:E7:18:5B:B3:F5:D7:39:DF:03:00:08:14:E3:E8:67:D2:63:A7:2C:9F:39:73:AA`.
+Its Android origin is
+`android:apk-key-hash:S-99GCz0YjkQ5xhbs_XXOd8DAAgU4-hn0mOnLJ85c6o`.
+Update both the gateway's per-host Android allowlist and RP-domain Digital Asset
+Links to this identity before real login. These are public certificate facts,
+not the private signing key or a personal gateway address.
 
 Tests use synthetic messages and credentials only. They cover remote
 down/repeat/up, explicit send/discard, empty transcripts, unknown results,

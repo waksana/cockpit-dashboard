@@ -66,6 +66,14 @@ final class HostClient {
                 }).build();
     }
 
+    static String normalizeAddress(String entered) {
+        String address = entered.trim();
+        if (address.isEmpty()) throw new IllegalArgumentException("请输入 Cockpit 域名");
+        if (!address.contains("://")) address = "https://" + address;
+        validateSettings(address, "settings", "");
+        return HttpUrl.get(address).toString();
+    }
+
     static void validateSettings(String address, String sessionId, String authorization) {
         HttpUrl url = HttpUrl.get(address);
         if (!url.isHttps() || !url.username().isEmpty() || !url.password().isEmpty()
@@ -118,6 +126,12 @@ final class HostClient {
 
     JSONObject intent(String name, JSONObject body) throws IOException, JSONException {
         return request("/intent/" + name, body);
+    }
+
+    SessionDirectory directory(String cursor) throws IOException, JSONException {
+        JSONObject body = new JSONObject().put("limit", SessionDirectory.PAGE_SIZE);
+        if (cursor != null) body.put("cursor", cursor);
+        return new SessionDirectory(intent("session/directory", body));
     }
 
     JSONObject meta() throws IOException, JSONException {

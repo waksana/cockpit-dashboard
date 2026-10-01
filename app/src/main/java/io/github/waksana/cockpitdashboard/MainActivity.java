@@ -21,6 +21,8 @@ import android.widget.TextView;
 import java.io.IOException;
 import java.security.GeneralSecurityException;
 import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import org.json.JSONArray;
@@ -43,6 +45,10 @@ public final class MainActivity extends Activity {
     private AudioCapture capture;
     private SpeechTranscriber speech;
     private PasskeyLogin login;
+    private AlertDialog navigation;
+    private AppUpdater updater;
+    private boolean checkedForUpdates;
+    private String updateNotice = "";
     private ScrollView scroll;
     private LinearLayout conversation;
     private TextView heading, status, draftView, questionView;
@@ -73,6 +79,16 @@ public final class MainActivity extends Activity {
             notice = "无法解密本地配置，已禁止发送。请在 Android 设置中清除本 App 数据后重新配置。";
         }
         createViews();
+        updater = new AppUpdater(this, new AppUpdater.Listener() {
+            @Override public boolean isReady() {
+                return foreground && !dialog && login == null && !storageFailed
+                        && state.phase == RemoteState.Phase.IDLE;
+            }
+            @Override public void status(String message) {
+                updateNotice = message;
+                renderState();
+            }
+        });
     }
 
     private TextView text(int size, int color) {
@@ -122,20 +138,21 @@ public final class MainActivity extends Activity {
         foreground = true;
         if (login != null) {
             login.resume();
-            return;
-        }
-        if (loginFailurePendingResume) {
+        } else if (loginFailurePendingResume) {
             loginFailurePendingResume = false;
             renderState();
-            return;
-        }
-        if (settings.optString("address").isEmpty()) {
-            main.post(() -> { if (!storageFailed && !dialog && foreground) openSettings(); });
         } else connect();
+        updater.resume();
+        if (!checkedForUpdates) {
+            checkedForUpdates = true;
+            updater.check(false);
+        }
     }
 
     @Override protected void onPause() {
         foreground = false;
+        if (updater != null) updater.pause();
+        if (navigation != null) navigation.dismiss();
         if (login != null) login.pause();
         connectionEpoch++;
         busyRead = false;
@@ -149,6 +166,7 @@ public final class MainActivity extends Activity {
         recordingEpoch++;
         connectionEpoch++;
         if (login != null) login.cancel();
+        if (updater != null) updater.destroy();
         if (capture != null) capture.cancel();
         if (speech != null) speech.cancel();
         if (pendingAudio != null) Arrays.fill(pendingAudio, (byte) 0);
@@ -180,7 +198,17 @@ public final class MainActivity extends Activity {
     }
 
     private void connect() {
-        if (!foreground || storageFailed || login != null) return;
+        if (!foreground || storageFailed || login != null || dialog) return;
+        if (settings.optString("address").isEmpty()) {
+            openSettings();
+            return;
+        }
+        if (settings.optString("sessionId").isEmpty()) {
+            if (settings.optJSONObject("gateSession") != null || !settings.optString("authorization").isEmpty()) {
+                chooseSession();
+            } else showWelcome();
+            return;
+        }
         final int epoch = ++connectionEpoch;
         main.removeCallbacks(poll);
         busyRead = true;
@@ -364,11 +392,14 @@ public final class MainActivity extends Activity {
             default: hint = "按住确定键说话 · 上下滚动 · 返回键设置";
         }
         status.setText(hint + (notice.isEmpty() ? "" : "\n" + notice)
-                + (receipt.isEmpty() ? "" : "\n" + receipt));
+                + (receipt.isEmpty() ? "" : "\n" + receipt)
+                + (updateNotice.isEmpty() ? "" : "\n" + updateNotice));
         status.setTextColor(capturing ? Color.rgb(255, 105, 105) : Color.LTGRAY);
+        if (updater != null) main.post(updater::presentIfReady);
     }
 
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
+        if (updater != null && updater.isPresenting()) return super.dispatchKeyEvent(event);
         if (login != null) {
             if (event.getKeyCode() == KeyEvent.KEYCODE_BACK && event.getAction() == KeyEvent.ACTION_DOWN
                     && event.getRepeatCount() == 0) {
@@ -586,17 +617,165 @@ public final class MainActivity extends Activity {
     private void showMenu() {
         if (dialog) return;
         interruptRecording();
-        dialog = true;
-        new AlertDialog.Builder(this).setTitle("Cockpit Dashboard")
-                .setItems(new String[]{"返回聊天", "重新连接（不重发）", "连接设置",
-                        "Passkey 登录（原生试验）", "退出登录（仅本机）", "关闭 App（保留登录）"},
+        Runnable[] after = new Runnable[1];
+        AlertDialog box = new AlertDialog.Builder(this).setTitle("Cockpit Dashboard")
+                .setItems(new String[]{"返回聊天", "重新连接（不重发）", "选择会话", "高级连接设置",
+                        "Passkey 登录（原生试验）", "退出登录（仅本机）", "检查应用更新", "关闭 App（保留登录）"},
                         (d, which) -> {
-                            if (which == 1) connect();
-                            if (which == 2) main.post(this::openSettings);
-                            if (which == 3) main.post(this::startLogin);
-                            if (which == 4) main.post(this::confirmLogout);
-                            if (which == 5) finish();
-                        }).setOnDismissListener(d -> dialog = false).show();
+                            if (which == 1) after[0] = this::connect;
+                            if (which == 2) after[0] = this::chooseSession;
+                            if (which == 3) after[0] = this::openSettings;
+                            if (which == 4) after[0] = this::startLogin;
+                            if (which == 5) after[0] = this::confirmLogout;
+                            if (which == 6) after[0] = () -> updater.check(true);
+                            if (which == 7) after[0] = this::finish;
+                        }).create();
+        showNavigation(box, after, () -> {});
+    }
+
+    private void showNavigation(AlertDialog box, Runnable[] after, Runnable cleanup) {
+        navigation = box;
+        dialog = true;
+        box.setOnDismissListener(d -> {
+            // Android dispatches dismissal asynchronously: an old dialog must not clear its replacement.
+            if (navigation != box) return;
+            navigation = null;
+            dialog = false;
+            cleanup.run();
+            if (foreground && !isDestroyed() && after[0] != null) after[0].run();
+        });
+        box.show();
+    }
+
+    private void showWelcome() {
+        if (dialog || !foreground || storageFailed) return;
+        Runnable[] after = new Runnable[1];
+        AlertDialog box = new AlertDialog.Builder(this).setTitle("登录并选择会话")
+                .setMessage(settings.optString("address") + "\n已保存地址，无需输入会话 ID。\n"
+                        + "先登录，再用遥控器从全部会话里选择一个。\n原生扫码需要设备支持和网关适配。")
+                .setPositiveButton("Passkey 登录", (d, w) -> after[0] = this::startLogin)
+                .setNeutralButton("高级设置", (d, w) -> after[0] = this::openSettings)
+                .setNegativeButton("稍后", null).create();
+        showNavigation(box, after, () -> {});
+    }
+
+    private boolean canSwitchSession() {
+        if (state.phase != RemoteState.Phase.IDLE) {
+            notice = "请先处理或取消当前草稿；发送中或结果未知时不能更换会话";
+            renderState();
+            return false;
+        }
+        return true;
+    }
+
+    private void chooseSession() {
+        if (!foreground || storageFailed || dialog || login != null || !canSwitchSession()) return;
+        loadDirectory(new ArrayList<>(), null);
+    }
+
+    private void loadDirectory(List<String> previous, String cursor) {
+        if (!foreground || storageFailed || !canSwitchSession()) return;
+        disconnect();
+        final int epoch = connectionEpoch;
+        busyRead = true;
+        notice = "正在读取全部会话…";
+        renderState();
+        final HostClient directoryClient;
+        try {
+            String address = settings.getString("address");
+            HostClient.validateSettings(address, "directory", settings.optString("authorization"));
+            directoryClient = new HostClient(address, "", settings.optString("authorization"),
+                    GateSession.fromJSON(settings.optJSONObject("gateSession")));
+        } catch (JSONException | IllegalArgumentException error) {
+            busyRead = false;
+            notice = "无法读取会话列表：" + safe(error);
+            renderState();
+            return;
+        }
+        Runnable[] after = new Runnable[1];
+        AlertDialog loading = new AlertDialog.Builder(this).setTitle("正在读取会话")
+                .setMessage("只读取会话目录，不会加载会话。")
+                .setNegativeButton("取消", null).create();
+        showNavigation(loading, after, () -> {
+            connectionEpoch++;
+            busyRead = false;
+        });
+        reads.execute(() -> {
+            try {
+                SessionDirectory page = directoryClient.directory(cursor);
+                main.post(() -> {
+                    if (!valid(epoch)) return;
+                    after[0] = () -> showDirectory(page, previous, cursor);
+                    loading.dismiss();
+                });
+            } catch (IOException | JSONException error) {
+                main.post(() -> {
+                    if (!valid(epoch)) return;
+                    after[0] = () -> showDirectoryError(error);
+                    loading.dismiss();
+                });
+            }
+        });
+    }
+
+    private void showDirectoryError(Exception error) {
+        notice = "会话列表读取失败：" + safe(error);
+        renderState();
+        Runnable[] after = new Runnable[1];
+        AlertDialog box = new AlertDialog.Builder(this).setTitle("无法读取会话")
+                .setMessage(notice + "\n列表变化可重新读取；需要登录时请选择 Passkey。")
+                .setPositiveButton(error instanceof HostClient.AuthenticationRequired ? "Passkey 登录" : "重新读取",
+                        (d, w) -> after[0] = error instanceof HostClient.AuthenticationRequired
+                                ? this::startLogin : this::chooseSession)
+                .setNegativeButton("返回", null).create();
+        showNavigation(box, after, () -> {});
+    }
+
+    private void showDirectory(SessionDirectory page, List<String> previous, String cursor) {
+        if (!foreground || storageFailed) return;
+        Runnable[] after = new Runnable[1];
+        String[] labels = new String[page.entries.size()];
+        for (int i = 0; i < labels.length; i++) labels[i] = page.entries.get(i).label(settings.optString("sessionId"));
+        AlertDialog.Builder builder = new AlertDialog.Builder(this)
+                .setTitle("选择会话 · 第 " + (previous.size() + 1) + " 页")
+                .setNegativeButton("返回聊天", (d, w) -> after[0] = () -> {
+                    if (!settings.optString("sessionId").isEmpty()) connect();
+                });
+        if (labels.length == 0) builder.setMessage("此页没有会话；请在 Cockpit 创建会话后重新读取。");
+        else builder.setItems(labels, (d, which) -> after[0] = () -> selectSession(page.entries.get(which)));
+        if (page.next != null) {
+            builder.setPositiveButton("下一页", (d, w) -> {
+                List<String> history = new ArrayList<>(previous);
+                history.add(cursor);
+                after[0] = () -> loadDirectory(history, page.next);
+            });
+        }
+        if (!previous.isEmpty()) {
+            builder.setNeutralButton("上一页", (d, w) -> {
+                List<String> history = new ArrayList<>(previous);
+                String back = history.remove(history.size() - 1);
+                after[0] = () -> loadDirectory(history, back);
+            });
+        }
+        showNavigation(builder.create(), after, () -> {});
+    }
+
+    private void selectSession(SessionDirectory.Entry selected) {
+        if (!foreground || storageFailed || !canSwitchSession()) return;
+        disconnect();
+        try {
+            settings.put("sessionId", selected.id);
+            meta = null;
+            target = null;
+            receipt = "";
+            projection.clear();
+            renderMessages(false);
+            if (persist()) connect();
+        } catch (JSONException error) {
+            storageFailed = true;
+            notice = "所选会话无法保存，已禁止发送";
+            renderState();
+        }
     }
 
     private boolean authenticationAvailable() {
@@ -618,7 +797,10 @@ public final class MainActivity extends Activity {
 
     private void startLogin() {
         if (!authenticationAvailable()) return;
-        if (settings.optString("address").isEmpty()) { openSettings(); return; }
+        if (settings.optString("address").isEmpty()) {
+            openSettings();
+            return;
+        }
         try {
             GateApi gate = new GateApi(settings.getString("address"));
             disconnect();
@@ -657,8 +839,8 @@ public final class MainActivity extends Activity {
 
     private void confirmLogout() {
         if (!authenticationAvailable() || dialog) return;
-        dialog = true;
-        new AlertDialog.Builder(this).setTitle("退出本机登录")
+        Runnable[] after = new Runnable[1];
+        AlertDialog box = new AlertDialog.Builder(this).setTitle("退出本机登录")
                 .setMessage("清除本机保存的 Cookie 和 Authorization，但保留连接设置、草稿与未知发送状态。"
                         + "不会撤销服务端会话；如需撤销，请在网关管理页操作。关闭 App 无需退出登录。")
                 .setPositiveButton("清除本机登录", (d, which) -> {
@@ -671,8 +853,8 @@ public final class MainActivity extends Activity {
                     if (!storageFailed) notice = "已退出本机登录；请重新登录后连接";
                     renderMessages(false);
                     renderState();
-                }).setNegativeButton("取消", null)
-                .setOnDismissListener(d -> dialog = false).show();
+                }).setNegativeButton("取消", null).create();
+        showNavigation(box, after, () -> {});
     }
 
     private EditText input(LinearLayout form, String label, String value, boolean secret) {
@@ -690,20 +872,17 @@ public final class MainActivity extends Activity {
 
     private void openSettings() {
         if (dialog || !foreground || storageFailed) return;
-        if (state.phase != RemoteState.Phase.IDLE) {
-            notice = "请先处理或取消当前草稿，再更换连接；不会把旧草稿发到新会话";
-            renderState(); return;
-        }
-        dialog = true;
+        if (!canSwitchSession()) return;
+        Runnable[] after = new Runnable[1];
         LinearLayout form = new LinearLayout(this);
         form.setOrientation(LinearLayout.VERTICAL);
         form.setPadding(24, 8, 24, 8);
-        EditText address = input(form, "Cockpit HTTPS 根地址", settings.optString("address"), false);
-        EditText session = input(form, "已有常规 session ID（从 Cockpit 会话链接取得）", settings.optString("sessionId"), false);
-        EditText authorization = input(form, "网关 Authorization（Basic/Bearer；可留空，不是 GitHub token）",
+        boolean first = settings.optString("address").isEmpty();
+        EditText address = input(form, "Cockpit 域名（自动使用 HTTPS）", settings.optString("address"), false);
+        EditText authorization = first ? null : input(form, "网关 Authorization（Basic/Bearer；可留空，不是 GitHub token）",
                 settings.optString("authorization"), true);
         TextView info = text(15, Color.LTGRAY);
-        info.setText("仅连接这一个 session；不创建、管理或切换其他会话。\n录音经现有 Speech/Azure 转写并产生费用；不会自动发送。\n"
+        info.setText("会话从列表选择，无需输入 ID；只聊天，不创建或管理会话。\n录音经现有 Speech/Azure 转写并产生费用；不会自动发送。\n"
                 + "原生 Passkey 需 API 28+、兼容凭据提供器和网关适配；扫码入口由系统决定。\n"
                 + "有效登录会加密保留，关闭 App / 重启设备不退出登录。\n"
                 + "Android " + Build.VERSION.RELEASE + " / API " + Build.VERSION.SDK_INT
@@ -711,34 +890,37 @@ public final class MainActivity extends Activity {
         form.addView(info);
         ScrollView formScroll = new ScrollView(this);
         formScroll.addView(form);
-        AlertDialog box = new AlertDialog.Builder(this).setTitle("首次连接 / 设置")
-                .setView(formScroll).setPositiveButton("保存并连接", null)
-                .setNeutralButton("保存并用 Passkey 登录", null)
-                .setNegativeButton("取消", null).create();
-        box.setOnDismissListener(d -> { dialog = false; fullscreen(); });
+        AlertDialog.Builder builder = new AlertDialog.Builder(this).setTitle(first ? "连接 Cockpit" : "高级连接设置")
+                .setView(formScroll).setPositiveButton(first ? "保存并用 Passkey 登录" : "保存并连接", null)
+                .setNegativeButton("取消", null);
+        if (!first) builder.setNeutralButton("保存并用 Passkey 登录", null);
+        AlertDialog box = builder.create();
         box.setOnShowListener(d -> {
             box.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
             View.OnClickListener save = v -> {
                 try {
-                    String url = address.getText().toString().trim();
-                    String id = session.getText().toString().trim();
-                    String auth = authorization.getText().toString().trim();
-                    HostClient.validateSettings(url, id, auth);
+                    String url = HostClient.normalizeAddress(address.getText().toString());
+                    String auth = authorization == null ? "" : authorization.getText().toString().trim();
+                    HostClient.validateSettings(url, "settings", auth);
                     url = okhttp3.HttpUrl.get(url).toString();
-                    if (!url.equals(settings.optString("address")) || !auth.isEmpty()) settings.remove("gateSession");
-                    settings.put("address", url).put("sessionId", id).put("authorization", auth);
+                    if (!url.equals(settings.optString("address"))) {
+                        settings.remove("gateSession");
+                        settings.remove("sessionId");
+                    }
+                    if (!auth.isEmpty()) settings.remove("gateSession");
+                    settings.put("address", url).put("authorization", auth);
                     meta = null; receipt = "";
                     if (persist()) {
+                        after[0] = first || v == box.getButton(AlertDialog.BUTTON_NEUTRAL)
+                                ? this::startLogin : this::chooseSession;
                         box.dismiss();
-                        if (v == box.getButton(AlertDialog.BUTTON_NEUTRAL)) startLogin();
-                        else connect();
                     }
                 } catch (JSONException | IllegalArgumentException error) { info.setText(safe(error)); }
             };
             box.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(save);
-            box.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(save);
+            if (!first) box.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(save);
         });
-        box.show();
+        showNavigation(box, after, this::fullscreen);
     }
 
     private static String safe(Exception error) {
