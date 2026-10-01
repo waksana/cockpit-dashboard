@@ -19,29 +19,71 @@ final class HostClient {
     final HttpUrl origin;
     final String sessionId;
     private final String authorization;
+    private final GateSession gateSession;
+    private final DeviceCredentials device;
 
-    static final class Rejected extends IOException {
+    static class Rejected extends IOException {
         Rejected(String message) { super(message); }
     }
 
+    static final class AuthenticationRequired extends Rejected {
+        AuthenticationRequired(String message) { super(message); }
+    }
+
     HostClient(String address, String sessionId, String authorization) {
-        this(HttpUrl.get(address), sessionId, authorization, new OkHttpClient.Builder()
+        this(address, sessionId, authorization, null);
+    }
+
+    HostClient(String address, String sessionId, String authorization, GateSession gateSession) {
+        this(HttpUrl.get(address), sessionId, authorization, newHttp(), gateSession);
+    }
+
+    static OkHttpClient newHttp() {
+        return transport(new OkHttpClient.Builder()
                 .retryOnConnectionFailure(false).followRedirects(false).followSslRedirects(false)
                 .connectTimeout(15, TimeUnit.SECONDS).readTimeout(40, TimeUnit.SECONDS)
                 .callTimeout(45, TimeUnit.SECONDS).build());
     }
 
     HostClient(HttpUrl origin, String sessionId, String authorization, OkHttpClient http) {
+        this(origin, sessionId, authorization, http, null);
+    }
+
+    HostClient(HttpUrl origin, String sessionId, String authorization, OkHttpClient http, GateSession gateSession) {
+        this(origin, sessionId, authorization, http, gateSession, null);
+    }
+
+    HostClient(String address, String sessionId, String authorization, GateSession gateSession,
+            DeviceCredentials device) {
+        this(HttpUrl.get(address), sessionId, authorization, newHttp(), gateSession, device);
+    }
+
+    HostClient(HttpUrl origin, String sessionId, String authorization, OkHttpClient http,
+            GateSession gateSession, DeviceCredentials device) {
         this.origin = origin;
         this.sessionId = sessionId;
         this.authorization = authorization;
-        this.http = http.newBuilder().retryOnConnectionFailure(false)
+        this.gateSession = gateSession;
+        this.device = device;
+        this.http = transport(http);
+    }
+
+    static OkHttpClient transport(OkHttpClient http) {
+        return http.newBuilder().retryOnConnectionFailure(false)
                 .followRedirects(false).followSslRedirects(false).addNetworkInterceptor(chain -> {
                     Response response = chain.proceed(chain.request());
                     // OkHttp otherwise repeats 503 + Retry-After: 0 even with connection retries off.
                     return response.code() == 503
                             ? response.newBuilder().header("Retry-After", "1").build() : response;
                 }).build();
+    }
+
+    static String normalizeAddress(String entered) {
+        String address = entered.trim();
+        if (address.isEmpty()) throw new IllegalArgumentException("请输入 Cockpit 域名");
+        if (!address.contains("://")) address = "https://" + address;
+        validateSettings(address, "settings", "");
+        return HttpUrl.get(address).toString();
     }
 
     static void validateSettings(String address, String sessionId, String authorization) {
@@ -64,9 +106,20 @@ final class HostClient {
         if (url == null || !url.scheme().equals(origin.scheme()) || !url.host().equals(origin.host())
                 || url.port() != origin.port()) throw new Rejected("拒绝跨站请求");
         Request.Builder builder = new Request.Builder().url(url).header("Accept", "application/json");
-        if (!authorization.isEmpty()) builder.header("Authorization", authorization);
+        if (device != null) {
+            builder.header("Authorization", device.header(url, token -> new DeviceOAuth(origin, http).refresh(token)));
+        } else {
+            if (!authorization.isEmpty()) builder.header("Authorization", authorization);
+            if (gateSession != null) builder.header("Cookie", gateSession.header(url, System.currentTimeMillis()));
+        }
         if (body != null) builder.post(RequestBody.create(body.toString(), JSON));
         try (Response response = http.newCall(builder.build()).execute()) {
+            HttpUrl redirect = response.header("Location") == null ? null : url.resolve(response.header("Location"));
+            if (response.code() == 401 || (response.isRedirect() && redirect != null
+                    && redirect.scheme().equals(origin.scheme()) && redirect.host().equals(origin.host())
+                    && redirect.port() == origin.port() && redirect.encodedPath().equals("/_gate/login"))) {
+                throw new AuthenticationRequired("网关要求登录：按返回键选择扫码登录，或检查 Authorization");
+            }
             // A proxy/5xx can fail after the mutation reached the host; never call it rejected.
             if (!response.isSuccessful()) {
                 String message = "HTTP " + response.code() + "，请检查连接、鉴权及 Cockpit 状态";
@@ -75,17 +128,26 @@ final class HostClient {
                 }
                 throw new IOException(message);
             }
-            if (response.body() == null) throw new IOException("后端响应为空");
-            if (response.body().contentLength() > MAX_RESPONSE) throw new IOException("响应过大，请缩小历史窗口");
-            response.body().source().request(MAX_RESPONSE + 1L);
-            if (response.body().source().getBuffer().size() > MAX_RESPONSE) throw new IOException("响应过大，请缩小历史窗口");
-            byte[] bytes = response.body().source().getBuffer().readByteArray();
-            return new JSONObject(new String(bytes, java.nio.charset.StandardCharsets.UTF_8));
+            return readJSON(response, MAX_RESPONSE);
         }
+    }
+
+    static JSONObject readJSON(Response response, int limit) throws IOException, JSONException {
+        if (response.body() == null) throw new IOException("后端响应为空");
+        if (response.body().contentLength() > limit) throw new IOException("响应过大");
+        response.body().source().request(limit + 1L);
+        if (response.body().source().getBuffer().size() > limit) throw new IOException("响应过大");
+        return new JSONObject(response.body().source().getBuffer().readUtf8());
     }
 
     JSONObject intent(String name, JSONObject body) throws IOException, JSONException {
         return request("/intent/" + name, body);
+    }
+
+    SessionDirectory directory(String cursor) throws IOException, JSONException {
+        JSONObject body = new JSONObject().put("limit", SessionDirectory.PAGE_SIZE);
+        if (cursor != null) body.put("cursor", cursor);
+        return new SessionDirectory(intent("session/directory", body));
     }
 
     JSONObject meta() throws IOException, JSONException {

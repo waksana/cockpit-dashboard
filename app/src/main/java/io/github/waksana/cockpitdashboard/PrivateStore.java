@@ -19,8 +19,14 @@ import org.json.JSONObject;
 final class PrivateStore {
     private static final String ALIAS = "cockpit-dashboard-local";
     private final SharedPreferences preferences;
+    private final String payload;
     PrivateStore(Context context) {
+        this(context, "payload");
+    }
+
+    PrivateStore(Context context, String payload) {
         preferences = context.getSharedPreferences("private-state", Context.MODE_PRIVATE);
+        this.payload = payload;
     }
 
     private SecretKey key() throws GeneralSecurityException, IOException {
@@ -38,7 +44,7 @@ final class PrivateStore {
     }
 
     JSONObject read() throws GeneralSecurityException, IOException, JSONException {
-        String encoded = preferences.getString("payload", null);
+        String encoded = preferences.getString(payload, null);
         if (encoded == null) return new JSONObject();
         JSONObject envelope = new JSONObject(encoded);
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
@@ -55,7 +61,7 @@ final class PrivateStore {
                 .put("iv", Base64.encodeToString(cipher.getIV(), Base64.NO_WRAP))
                 .put("data", Base64.encodeToString(cipher.doFinal(value.toString()
                         .getBytes(StandardCharsets.UTF_8)), Base64.NO_WRAP));
-        if (!preferences.edit().putString("payload", envelope.toString()).commit()) {
+        if (!preferences.edit().putString(payload, envelope.toString()).commit()) {
             throw new IOException("Unable to persist local state");
         }
     }
