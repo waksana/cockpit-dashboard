@@ -48,10 +48,9 @@ be sent. Right cancellation cannot undo already incurred Azure processing/cost.
 
 On first launch, enter the HTTPS root URL, session ID and, if applicable, the
 gateway's `Authorization` value (`Basic ...` or `Bearer ...`). This is **not**
-the GitHub/Copilot token. The app does not implement a browser passkey/cookie
-login flow. If the existing gateway only supports browser authentication,
-operator-provided native-client authentication is a prerequisite; do not expose
-an unauthenticated Cockpit port to work around it.
+the GitHub/Copilot token. Alternatively choose **Save and sign in with Passkey**
+for the opt-in native trial described below. Do not expose an unauthenticated
+Cockpit port to work around a missing credential provider or gateway setup.
 
 Settings and retained draft/uncertain-send state are encrypted with an
 Android Keystore AES-GCM key. Android backup and screenshots are disabled.
@@ -64,6 +63,46 @@ The intended device is an XGIMI Z7X with a USB DJI receiver, but **this is not a
 hardware compatibility claim**. GMUI firmware labels do not establish Android
 API level. USB routing, 24 kHz support, remote key events, runtime permissions
 and sideloading require acceptance on the real device.
+
+## Native Passkey trial
+
+The app uses Android Credential Manager, not a WebView, browser-cookie export,
+custom QR code or OAuth device-code service. It requests an existing passkey
+from the configured gateway; it never registers one. The system may offer
+"another phone or tablet" and a QR code, but **QR availability is not guaranteed**.
+Native passkeys require Android 9/API 28+ and a compatible credential provider.
+Google Play services is a supported provider path, not evidence that GMUI ships
+it. The app reports unavailable providers, cancellation and authentication errors
+without silently changing authentication methods or retrying assertions.
+
+The operator must first deploy a compatible
+[Passkey Gate](https://github.com/waksana/passkey-gate#android-login), enable this
+APK's exact Android signing origin **only for the configured Cockpit host**, and
+publish Digital Asset Links at the gateway's RP ID domain. The association uses
+the application ID and signing **certificate** fingerprint, not the APK hash.
+Browser-only gateway configuration is insufficient. The trial does not deploy
+those changes. Use a trusted HTTPS root on port 443.
+
+The app obtains options from `/_gate/auth/options`, passes `publicKey` unchanged
+to Credential Manager, and posts the returned assertion to `/_gate/auth/finish`.
+Client/flow cookies are kept only for that attempt. The resulting host-only
+`__Host-pg_session` cookie and absolute expiry are saved in the existing
+Android Keystore-encrypted state. No cookie is forwarded to Azure or another
+host, scheme or port. Successful Passkey login replaces local Authorization.
+
+**Closing the app, reopening it, or rebooting the projector retains a valid
+login.** Expiration or server-side revocation prompts explicit login again;
+activity does not extend the server's fixed lifetime. The menu distinguishes
+closing the app from **Sign out (this device only)**. Sign-out clears the saved
+cookie and Authorization but retains settings, drafts and uncertain-send state.
+It does not claim server-side revocation: use the gateway's management site to
+revoke sessions. Changing the site clears the old cookie. Cancellation and
+process destruction abandon the login attempt, never a chat mutation.
+
+The intended acceptance device is XGIMI Z7X / GMUI 6
+`6.11.101.01_499`. Installation, the native prompt/QR, phone approval, actual
+gateway login, restart persistence and revocation must be confirmed there.
+JVM tests do not prove any of those real-device outcomes.
 
 ## Public API contract
 
@@ -108,7 +147,7 @@ distribution checksum:
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Version `0.1.0` / version code `1`, application ID
+Version `0.2.0-passkey-trial` / version code `2`, application ID
 `io.github.waksana.cockpitdashboard`. The output is a **debug-signed sideload
 APK**, not a store release or a user-signed production build. It appears in
 both ordinary and TV launchers. A different debug signing key may require

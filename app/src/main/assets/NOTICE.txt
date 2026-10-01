@@ -4,12 +4,13 @@ OkHttp 4.12.0 and Okio 3.6.0: Copyright Square, Inc.
 https://github.com/square/okhttp
 https://github.com/square/okio
 
-Kotlin standard library 1.9.10 and JetBrains annotations:
+Kotlin standard library, kotlinx.coroutines and JetBrains annotations:
 Copyright JetBrains s.r.o. and Kotlin Programming Language contributors.
 https://github.com/JetBrains/kotlin
 https://github.com/JetBrains/java-annotations
 
-AndroidX annotations 1.1.0: Copyright The Android Open Source Project.
+AndroidX libraries, including Credential Manager 1.5.0:
+Copyright The Android Open Source Project.
 https://android.googlesource.com/platform/frameworks/support/
 
 Markwon 4.6.2: Copyright Dimitry Ivanov.
@@ -17,6 +18,12 @@ https://github.com/noties/Markwon
 
 The projects above are distributed under the Apache License, Version 2.0,
 included in Apache-2.0.txt in this application's assets.
+
+Google Play services client libraries (Credential Manager provider integration):
+Copyright Google LLC.
+https://developers.google.com/android/guides/overview
+Android Software Development Kit License:
+https://developer.android.com/studio/terms.html
 
 CommonMark Java 0.13.0:
 https://github.com/commonmark/commonmark-java

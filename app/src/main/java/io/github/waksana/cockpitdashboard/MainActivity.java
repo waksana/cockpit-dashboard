@@ -42,12 +42,14 @@ public final class MainActivity extends Activity {
     private HostClient client;
     private AudioCapture capture;
     private SpeechTranscriber speech;
+    private PasskeyLogin login;
     private ScrollView scroll;
     private LinearLayout conversation;
     private TextView heading, status, draftView, questionView;
     private Markwon markdown;
     private boolean foreground, dialog, connected, busyRead, live, hasOlder, storageFailed;
     private boolean capturing;
+    private boolean loginFailurePendingResume;
     private byte[] pendingAudio;
     private int connectionEpoch, recordingEpoch;
     private String olderCursor, forwardCursor;
@@ -118,6 +120,15 @@ public final class MainActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         foreground = true;
+        if (login != null) {
+            login.resume();
+            return;
+        }
+        if (loginFailurePendingResume) {
+            loginFailurePendingResume = false;
+            renderState();
+            return;
+        }
         if (settings.optString("address").isEmpty()) {
             main.post(() -> { if (!storageFailed && !dialog && foreground) openSettings(); });
         } else connect();
@@ -125,6 +136,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onPause() {
         foreground = false;
+        if (login != null) login.pause();
         connectionEpoch++;
         busyRead = false;
         connected = false;
@@ -136,6 +148,7 @@ public final class MainActivity extends Activity {
     @Override protected void onDestroy() {
         recordingEpoch++;
         connectionEpoch++;
+        if (login != null) login.cancel();
         if (capture != null) capture.cancel();
         if (speech != null) speech.cancel();
         if (pendingAudio != null) Arrays.fill(pendingAudio, (byte) 0);
@@ -167,7 +180,7 @@ public final class MainActivity extends Activity {
     }
 
     private void connect() {
-        if (!foreground || storageFailed) return;
+        if (!foreground || storageFailed || login != null) return;
         final int epoch = ++connectionEpoch;
         main.removeCallbacks(poll);
         busyRead = true;
@@ -181,7 +194,7 @@ public final class MainActivity extends Activity {
             HostClient.validateSettings(settings.getString("address"), settings.getString("sessionId"),
                     settings.optString("authorization"));
             next = new HostClient(settings.getString("address"), settings.getString("sessionId"),
-                    settings.optString("authorization"));
+                    settings.optString("authorization"), GateSession.fromJSON(settings.optJSONObject("gateSession")));
         } catch (JSONException | IllegalArgumentException error) {
             busyRead = false;
             notice = "连接配置无效，请按返回键打开设置";
@@ -356,6 +369,16 @@ public final class MainActivity extends Activity {
     }
 
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
+        if (login != null) {
+            if (event.getKeyCode() == KeyEvent.KEYCODE_BACK && event.getAction() == KeyEvent.ACTION_DOWN
+                    && event.getRepeatCount() == 0) {
+                login.cancel();
+                login = null;
+                notice = "已取消登录；不会自动重试";
+                renderState();
+            }
+            return true;
+        }
         if (dialog) return super.dispatchKeyEvent(event);
         int key = event.getKeyCode();
         if (key == KeyEvent.KEYCODE_BACK || key == KeyEvent.KEYCODE_MENU) {
@@ -565,12 +588,91 @@ public final class MainActivity extends Activity {
         interruptRecording();
         dialog = true;
         new AlertDialog.Builder(this).setTitle("Cockpit Dashboard")
-                .setItems(new String[]{"返回聊天", "重新连接（不重发）", "连接设置", "退出"},
+                .setItems(new String[]{"返回聊天", "重新连接（不重发）", "连接设置",
+                        "Passkey 登录（原生试验）", "退出登录（仅本机）", "关闭 App（保留登录）"},
                         (d, which) -> {
                             if (which == 1) connect();
                             if (which == 2) main.post(this::openSettings);
-                            if (which == 3) finish();
+                            if (which == 3) main.post(this::startLogin);
+                            if (which == 4) main.post(this::confirmLogout);
+                            if (which == 5) finish();
                         }).setOnDismissListener(d -> dialog = false).show();
+    }
+
+    private boolean authenticationAvailable() {
+        if (!foreground || storageFailed || login != null || state.phase == RemoteState.Phase.SENDING) {
+            notice = "当前不能变更登录；请等待发送回执或恢复前台";
+            renderState();
+            return false;
+        }
+        return true;
+    }
+
+    private void disconnect() {
+        connectionEpoch++;
+        connected = false;
+        busyRead = false;
+        main.removeCallbacks(poll);
+        client = null;
+    }
+
+    private void startLogin() {
+        if (!authenticationAvailable()) return;
+        if (settings.optString("address").isEmpty()) { openSettings(); return; }
+        try {
+            GateApi gate = new GateApi(settings.getString("address"));
+            disconnect();
+            notice = "正在请求原生 Passkey；系统支持时可选择其他手机并扫码。返回键取消。\n"
+                    + "首次使用需网关 App 白名单与域名关联；API " + Build.VERSION.SDK_INT;
+            renderState();
+            login = new PasskeyLogin(this, gate, new PasskeyLogin.Listener() {
+                @Override public void complete(GateSession session) {
+                    login = null;
+                    try {
+                        settings.put("gateSession", session.toJSON()).put("authorization", "");
+                        if (persist()) {
+                            notice = "登录已加密保存；关闭 App 或重启设备不会清除";
+                            renderState();
+                            connect();
+                        }
+                    } catch (JSONException error) {
+                        storageFailed = true;
+                        notice = "登录状态无法保存，已禁止发送";
+                        renderState();
+                    }
+                }
+                @Override public void failed(String message) {
+                    login = null;
+                    loginFailurePendingResume = !foreground;
+                    notice = message;
+                    renderState();
+                }
+            });
+            login.start();
+        } catch (JSONException | IllegalArgumentException error) {
+            notice = "不能启动 Passkey：" + safe(error);
+            renderState();
+        }
+    }
+
+    private void confirmLogout() {
+        if (!authenticationAvailable() || dialog) return;
+        dialog = true;
+        new AlertDialog.Builder(this).setTitle("退出本机登录")
+                .setMessage("清除本机保存的 Cookie 和 Authorization，但保留连接设置、草稿与未知发送状态。"
+                        + "不会撤销服务端会话；如需撤销，请在网关管理页操作。关闭 App 无需退出登录。")
+                .setPositiveButton("清除本机登录", (d, which) -> {
+                    disconnect();
+                    settings.remove("gateSession");
+                    settings.remove("authorization");
+                    meta = null;
+                    projection.clear();
+                    persist();
+                    if (!storageFailed) notice = "已退出本机登录；请重新登录后连接";
+                    renderMessages(false);
+                    renderState();
+                }).setNegativeButton("取消", null)
+                .setOnDismissListener(d -> dialog = false).show();
     }
 
     private EditText input(LinearLayout form, String label, String value, boolean secret) {
@@ -602,6 +704,8 @@ public final class MainActivity extends Activity {
                 settings.optString("authorization"), true);
         TextView info = text(15, Color.LTGRAY);
         info.setText("仅连接这一个 session；不创建、管理或切换其他会话。\n录音经现有 Speech/Azure 转写并产生费用；不会自动发送。\n"
+                + "原生 Passkey 需 API 28+、兼容凭据提供器和网关适配；扫码入口由系统决定。\n"
+                + "有效登录会加密保留，关闭 App / 重启设备不退出登录。\n"
                 + "Android " + Build.VERSION.RELEASE + " / API " + Build.VERSION.SDK_INT
                 + " · USB 实际采音需本机验证");
         form.addView(info);
@@ -609,21 +713,30 @@ public final class MainActivity extends Activity {
         formScroll.addView(form);
         AlertDialog box = new AlertDialog.Builder(this).setTitle("首次连接 / 设置")
                 .setView(formScroll).setPositiveButton("保存并连接", null)
+                .setNeutralButton("保存并用 Passkey 登录", null)
                 .setNegativeButton("取消", null).create();
         box.setOnDismissListener(d -> { dialog = false; fullscreen(); });
         box.setOnShowListener(d -> {
             box.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
-            box.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+            View.OnClickListener save = v -> {
                 try {
                     String url = address.getText().toString().trim();
                     String id = session.getText().toString().trim();
                     String auth = authorization.getText().toString().trim();
                     HostClient.validateSettings(url, id, auth);
+                    url = okhttp3.HttpUrl.get(url).toString();
+                    if (!url.equals(settings.optString("address")) || !auth.isEmpty()) settings.remove("gateSession");
                     settings.put("address", url).put("sessionId", id).put("authorization", auth);
                     meta = null; receipt = "";
-                    if (persist()) { box.dismiss(); connect(); }
+                    if (persist()) {
+                        box.dismiss();
+                        if (v == box.getButton(AlertDialog.BUTTON_NEUTRAL)) startLogin();
+                        else connect();
+                    }
                 } catch (JSONException | IllegalArgumentException error) { info.setText(safe(error)); }
-            });
+            };
+            box.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(save);
+            box.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(save);
         });
         box.show();
     }

@@ -2,6 +2,7 @@ package io.github.waksana.cockpitdashboard;
 
 import android.view.KeyEvent;
 import java.lang.reflect.Field;
+import org.json.JSONObject;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.robolectric.Robolectric;
@@ -65,6 +66,25 @@ public class MainActivityTest {
             activity.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_DPAD_CENTER));
             assertEquals(RemoteState.Phase.IDLE, state.phase);
             assertEquals("", state.draft);
+        }
+
+    }
+
+    @Test public void closingAndBackgroundKeepLoginAndUnknownDraft() throws Exception {
+        try (ActivityController<MainActivity> controller = Robolectric.buildActivity(MainActivity.class).create()) {
+            MainActivity activity = controller.get();
+            Field field = MainActivity.class.getDeclaredField("settings");
+            field.setAccessible(true);
+            JSONObject settings = (JSONObject) field.get(activity);
+            JSONObject session = new GateSession("https://example.com/", "A".repeat(43),
+                    System.currentTimeMillis() + 60000).toJSON();
+            settings.put("gateSession", session);
+            state(activity).restore("possibly sent", true);
+            activity.onPause();
+            activity.finish();
+            assertSame(session, settings.getJSONObject("gateSession"));
+            assertEquals("possibly sent", state(activity).draft);
+            assertEquals(RemoteState.Phase.UNKNOWN, state(activity).phase);
         }
     }
 }
