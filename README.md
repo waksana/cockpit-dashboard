@@ -48,7 +48,8 @@ be sent. Right cancellation cannot undo already incurred Azure processing/cost.
 
 On first launch enter your Cockpit hostname once, such as `cockpit.example.com`.
 The app defaults to HTTPS and saves the address locally; no personal host is
-bundled in the source or APK. Select **Save and sign in with Passkey**, then use
+bundled in the source or APK. Select **Save and sign in with QR**, scan with a
+phone and approve with its existing Passkey, then use
 up/down and confirm on the remote to select a session. No session ID typing is
 required. The directory includes all sessions
 regardless of role, loaded state or status; it does not auto-select an Assistant
@@ -62,7 +63,9 @@ Use **Choose session** in the menu to change it. Resolve/discard a draft or an
 uncertain send before switching; old text must never move to another destination.
 **Advanced connection settings** optionally changes the HTTPS root and gateway
 `Authorization` (`Basic ...` or `Bearer ...`, not the GitHub/Copilot token).
-Changing the site clears the old selection and cookie. Do not expose an
+Changing the site clears the old selection and all old credentials (device tokens,
+cookies and Authorization). For a new site's manual Authorization, save its hostname
+first and then reopen advanced settings. Do not expose an
 unauthenticated Cockpit port to bypass missing provider or gateway setup.
 
 Settings and retained draft/uncertain-send state are encrypted with an
@@ -77,10 +80,78 @@ hardware compatibility claim**. GMUI firmware labels do not establish Android
 API level. USB routing, 24 kHz support, remote key events, runtime permissions
 and sideloading require acceptance on the real device.
 
-## Native Passkey trial
+## Device QR authorization
 
-The app uses Android Credential Manager, not a WebView, browser-cookie export,
-custom QR code or OAuth device-code service. It requests an existing passkey
+The default sign-in uses RFC 8628 device authorization. The TV does not need
+Credential Manager, a passkey provider, Google Play services or a WebView.
+After an explicit sign-in action, the app posts form-encoded `client_id=cockpit-dashboard`
+and `scope=host-access` to the entered HTTPS origin's
+`/_gate/oauth/device_authorization`. The gateway returns a short-lived device
+code, user code and absolute HTTPS verification URLs on its configured Auth site.
+ZXing renders `verification_uri_complete` locally; no public QR service receives
+the URL. The QR contains the user code, never the device code or tokens. If the
+optional complete URI is absent, it opens the verification page and the user
+enters the displayed code instead.
+The screen also shows `user_code`, `verification_uri`, a countdown and cancellation.
+On the phone, check the site and matching code before approving with Passkey.
+
+Polling uses `/_gate/oauth/token` on the original Cockpit origin, never an
+endpoint derived from the QR. Requests use `client_id` and
+`grant_type=urn:ietf:params:oauth:grant-type:device_code` with `device_code`.
+The default interval is five seconds; `slow_down` permanently adds five seconds,
+and connection timeouts exponentially reduce polling frequency. Pending responses
+do not constitute login. Only a validated Bearer token response grants access.
+Denial, expiry, invalid/unknown errors and other network/protocol failures stop
+the attempt. Leaving the foreground or cancelling also abandons the attempt;
+returning does not automatically issue another device code. Late callbacks cannot
+restore a cancelled attempt. If approval occurred but its result was lost, inspect
+or revoke the device in the Auth page before starting another attempt.
+Gateway rate limits (HTTP 429, normally `Retry-After: 60`) and temporary capacity
+failures (HTTP 503) stop explicitly rather than silently retrying issuance or
+rotation. The sign-in screen displays a bounded retry-after hint when supplied;
+starting another grant still requires a new user action.
+
+Device tokens are stored in a separate payload of the same Keystore-encrypted
+`PrivateStore`, so refresh cannot overwrite drafts or uncertain-send markers.
+Cockpit requests carry an exact-origin-bound Bearer access token. Refresh begins
+when at most 60 seconds remain, with one in-process request shared across callers
+and activity recreation. A durable refresh-in-progress marker is committed before
+the rotating refresh token is sent. Lost responses, process death or storage
+uncertainty require a new QR login; the old refresh token is never blindly replayed.
+Refresh does not retry `prompt` or `respondAsk`, discard a draft, change the original
+ask target, or clear an UNKNOWN result. A pending send blocks login changes;
+drafts/UNKNOWN allow reauthentication only, not a host/session switch.
+
+The v1 gateway defaults are a 300-second device code, 900-second access token
+and a device-family absolute maximum of 30 days; activity/rotation cannot extend
+that server maximum. This is **host-access authorization**, not per-session
+permission isolation. The directory continues to include all sessions. A successful
+login opens selection when there is no draft, otherwise retains the original target.
+Existing manually configured Authorization/native cookies are replaced only after
+successful device login; a failed attempt leaves them intact.
+
+**Close app (keep login)** retains valid credentials. **Sign out (this device only)**
+removes local credentials but does not claim remote revocation. **Revoke this device**
+requires confirmation and posts `token`, `token_type_hint=refresh_token` and
+`client_id` to `/_gate/oauth/revoke`. HTTP 200 acknowledges the RFC 7009 request
+even for an unknown token. Failure is reported as unconfirmed, not remote success;
+local sign-out and the Auth page's remote revocation remain available. These actions
+retain drafts and do not retract messages. Neither GitHub nor Azure requests receive
+device credentials. There is no client secret in the APK.
+
+The synthetic contract fixture is `app/src/test/resources/device-oauth-v1.json`.
+`app/src/test/resources/gate-device-wire-v1.json` is copied without modification
+from [Passkey Gate's actual wire fixture at ae049b3](https://github.com/waksana/passkey-gate/blob/ae049b319da8bac212c99ec66b943ff77d55c5b3/testdata/device-wire-v1.json);
+its provenance remains that repository. App tests consume its real response and
+request shapes through TLS MockWebServer, including remaining-family lifetimes,
+terminal errors and 429/503. These are public synthetic examples, not credentials.
+Local/JVM coverage does not establish real gateway deployment, phone approval,
+projector display/scan compatibility or successful authentication.
+
+## Native Passkey compatibility trial
+
+The advanced menu retains Android Credential Manager as an optional compatibility
+path, separate from the default device QR flow. It requests an existing passkey
 from the configured gateway; it never registers one. The system may offer
 "another phone or tablet" and a QR code, but **QR availability is not guaranteed**.
 Native passkeys require Android 9/API 28+ and a compatible credential provider.
@@ -160,7 +231,7 @@ distribution checksum:
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-The local default is version `0.3.0` / version code `10000`, application ID
+The local default is version `0.3.2` / version code `10002`, application ID
 `io.github.waksana.cockpitdashboard`. It appears in ordinary and TV launchers.
 The command above produces a **debug** APK for development, not an update for
 the release-signed app. The first switch from an earlier debug trial to the
@@ -219,7 +290,7 @@ the three password/alias environment variables above, then run:
 ```sh
 ./gradlew --no-daemon assembleRelease
 mkdir -p release-output
-DASHBOARD_VERSION_CODE=10000 DASHBOARD_VERSION_NAME=0.3.0 \
+DASHBOARD_VERSION_CODE=10002 DASHBOARD_VERSION_NAME=0.3.2 \
   node scripts/release-metadata.mjs app/build/outputs/apk/release/app-release.apk \
   "$ANDROID_HOME/build-tools/35.0.0/aapt" "$ANDROID_HOME/build-tools/35.0.0/apksigner" release-output
 ```

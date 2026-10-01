@@ -45,6 +45,9 @@ public final class MainActivity extends Activity {
     private AudioCapture capture;
     private SpeechTranscriber speech;
     private PasskeyLogin login;
+    private DeviceLogin deviceLogin;
+    private DeviceCredentials deviceCredentials;
+    private boolean deviceAvailable, revoking;
     private AlertDialog navigation;
     private AppUpdater updater;
     private boolean checkedForUpdates;
@@ -69,11 +72,20 @@ public final class MainActivity extends Activity {
                 | WindowManager.LayoutParams.FLAG_SECURE);
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
         store = new PrivateStore(this);
+        deviceCredentials = new DeviceCredentials(this);
         try {
             settings = store.read();
             state.restore(settings.optString("draft"), settings.optBoolean("uncertain"));
             target = settings.optJSONObject("target");
             receipt = settings.optString("receipt");
+            if (!settings.optString("address").isEmpty()) {
+                deviceAvailable = deviceCredentials.present(settings.getString("address"));
+                if (deviceAvailable && (settings.has("gateSession") || settings.has("authorization"))) {
+                    settings.remove("gateSession");
+                    settings.remove("authorization");
+                    store.write(settings);
+                }
+            }
         } catch (GeneralSecurityException | IOException | JSONException | IllegalArgumentException error) {
             storageFailed = true;
             notice = "无法解密本地配置，已禁止发送。请在 Android 设置中清除本 App 数据后重新配置。";
@@ -81,7 +93,7 @@ public final class MainActivity extends Activity {
         createViews();
         updater = new AppUpdater(this, new AppUpdater.Listener() {
             @Override public boolean isReady() {
-                return foreground && !dialog && login == null && !storageFailed
+                return foreground && !dialog && login == null && deviceLogin == null && !revoking && !storageFailed
                         && state.phase == RemoteState.Phase.IDLE;
             }
             @Override public void status(String message) {
@@ -154,6 +166,7 @@ public final class MainActivity extends Activity {
         if (updater != null) updater.pause();
         if (navigation != null) navigation.dismiss();
         if (login != null) login.pause();
+        if (deviceLogin != null) deviceLogin.cancel("已离开前台，扫码登录停止");
         connectionEpoch++;
         busyRead = false;
         connected = false;
@@ -166,6 +179,7 @@ public final class MainActivity extends Activity {
         recordingEpoch++;
         connectionEpoch++;
         if (login != null) login.cancel();
+        if (deviceLogin != null) deviceLogin.cancel("登录窗口已关闭");
         if (updater != null) updater.destroy();
         if (capture != null) capture.cancel();
         if (speech != null) speech.cancel();
@@ -198,13 +212,13 @@ public final class MainActivity extends Activity {
     }
 
     private void connect() {
-        if (!foreground || storageFailed || login != null || dialog) return;
+        if (!foreground || storageFailed || login != null || deviceLogin != null || revoking || dialog) return;
         if (settings.optString("address").isEmpty()) {
             openSettings();
             return;
         }
         if (settings.optString("sessionId").isEmpty()) {
-            if (settings.optJSONObject("gateSession") != null || !settings.optString("authorization").isEmpty()) {
+            if (deviceAvailable || settings.optJSONObject("gateSession") != null || !settings.optString("authorization").isEmpty()) {
                 chooseSession();
             } else showWelcome();
             return;
@@ -222,7 +236,8 @@ public final class MainActivity extends Activity {
             HostClient.validateSettings(settings.getString("address"), settings.getString("sessionId"),
                     settings.optString("authorization"));
             next = new HostClient(settings.getString("address"), settings.getString("sessionId"),
-                    settings.optString("authorization"), GateSession.fromJSON(settings.optJSONObject("gateSession")));
+                    settings.optString("authorization"), GateSession.fromJSON(settings.optJSONObject("gateSession")),
+                    deviceAvailable ? deviceCredentials : null);
         } catch (JSONException | IllegalArgumentException error) {
             busyRead = false;
             notice = "连接配置无效，请按返回键打开设置";
@@ -400,6 +415,12 @@ public final class MainActivity extends Activity {
 
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
         if (updater != null && updater.isPresenting()) return super.dispatchKeyEvent(event);
+        if (revoking) return true;
+        if (deviceLogin != null) {
+            if (event.getKeyCode() == KeyEvent.KEYCODE_BACK && event.getAction() == KeyEvent.ACTION_DOWN
+                    && event.getRepeatCount() == 0) deviceLogin.cancel("已取消扫码登录");
+            return true;
+        }
         if (login != null) {
             if (event.getKeyCode() == KeyEvent.KEYCODE_BACK && event.getAction() == KeyEvent.ACTION_DOWN
                     && event.getRepeatCount() == 0) {
@@ -620,15 +641,18 @@ public final class MainActivity extends Activity {
         Runnable[] after = new Runnable[1];
         AlertDialog box = new AlertDialog.Builder(this).setTitle("Cockpit Dashboard")
                 .setItems(new String[]{"返回聊天", "重新连接（不重发）", "选择会话", "高级连接设置",
-                        "Passkey 登录（原生试验）", "退出登录（仅本机）", "检查应用更新", "关闭 App（保留登录）"},
+                        "扫码登录（手机批准）", "退出登录（仅本机）", "检查应用更新", "关闭 App（保留登录）",
+                        "撤销此设备的服务端授权", "Passkey 登录（高级原生兼容）"},
                         (d, which) -> {
                             if (which == 1) after[0] = this::connect;
                             if (which == 2) after[0] = this::chooseSession;
                             if (which == 3) after[0] = this::openSettings;
-                            if (which == 4) after[0] = this::startLogin;
+                            if (which == 4) after[0] = this::startDeviceLogin;
                             if (which == 5) after[0] = this::confirmLogout;
                             if (which == 6) after[0] = () -> updater.check(true);
                             if (which == 7) after[0] = this::finish;
+                            if (which == 8) after[0] = this::confirmRevoke;
+                            if (which == 9) after[0] = this::startLogin;
                         }).create();
         showNavigation(box, after, () -> {});
     }
@@ -652,8 +676,8 @@ public final class MainActivity extends Activity {
         Runnable[] after = new Runnable[1];
         AlertDialog box = new AlertDialog.Builder(this).setTitle("登录并选择会话")
                 .setMessage(settings.optString("address") + "\n已保存地址，无需输入会话 ID。\n"
-                        + "先登录，再用遥控器从全部会话里选择一个。\n原生扫码需要设备支持和网关适配。")
-                .setPositiveButton("Passkey 登录", (d, w) -> after[0] = this::startLogin)
+                        + "先扫码登录，再用遥控器从全部会话里选择一个。\n手机使用 Passkey 批准，电视无需凭据提供器。")
+                .setPositiveButton("扫码登录", (d, w) -> after[0] = this::startDeviceLogin)
                 .setNeutralButton("高级设置", (d, w) -> after[0] = this::openSettings)
                 .setNegativeButton("稍后", null).create();
         showNavigation(box, after, () -> {});
@@ -669,7 +693,8 @@ public final class MainActivity extends Activity {
     }
 
     private void chooseSession() {
-        if (!foreground || storageFailed || dialog || login != null || !canSwitchSession()) return;
+        if (!foreground || storageFailed || dialog || login != null || deviceLogin != null || revoking
+                || !canSwitchSession()) return;
         loadDirectory(new ArrayList<>(), null);
     }
 
@@ -685,7 +710,7 @@ public final class MainActivity extends Activity {
             String address = settings.getString("address");
             HostClient.validateSettings(address, "directory", settings.optString("authorization"));
             directoryClient = new HostClient(address, "", settings.optString("authorization"),
-                    GateSession.fromJSON(settings.optJSONObject("gateSession")));
+                    GateSession.fromJSON(settings.optJSONObject("gateSession")), deviceAvailable ? deviceCredentials : null);
         } catch (JSONException | IllegalArgumentException error) {
             busyRead = false;
             notice = "无法读取会话列表：" + safe(error);
@@ -723,10 +748,10 @@ public final class MainActivity extends Activity {
         renderState();
         Runnable[] after = new Runnable[1];
         AlertDialog box = new AlertDialog.Builder(this).setTitle("无法读取会话")
-                .setMessage(notice + "\n列表变化可重新读取；需要登录时请选择 Passkey。")
-                .setPositiveButton(error instanceof HostClient.AuthenticationRequired ? "Passkey 登录" : "重新读取",
+                .setMessage(notice + "\n列表变化可重新读取；需要登录时请选择扫码登录。")
+                .setPositiveButton(error instanceof HostClient.AuthenticationRequired ? "扫码登录" : "重新读取",
                         (d, w) -> after[0] = error instanceof HostClient.AuthenticationRequired
-                                ? this::startLogin : this::chooseSession)
+                                ? this::startDeviceLogin : this::chooseSession)
                 .setNegativeButton("返回", null).create();
         showNavigation(box, after, () -> {});
     }
@@ -779,7 +804,9 @@ public final class MainActivity extends Activity {
     }
 
     private boolean authenticationAvailable() {
-        if (!foreground || storageFailed || login != null || state.phase == RemoteState.Phase.SENDING) {
+        if (!foreground || storageFailed || login != null || deviceLogin != null || revoking
+                || state.phase == RemoteState.Phase.SENDING || state.phase == RemoteState.Phase.RECORDING
+                || state.phase == RemoteState.Phase.TRANSCRIBING) {
             notice = "当前不能变更登录；请等待发送回执或恢复前台";
             renderState();
             return false;
@@ -793,6 +820,46 @@ public final class MainActivity extends Activity {
         busyRead = false;
         main.removeCallbacks(poll);
         client = null;
+    }
+
+    private void startDeviceLogin() {
+        if (!authenticationAvailable()) return;
+        if (settings.optString("address").isEmpty()) {
+            openSettings();
+            return;
+        }
+        final String address = settings.optString("address");
+        disconnect();
+        notice = "正在申请扫码登录；返回键取消。失败不会自动重新申请。";
+        renderState();
+        deviceLogin = new DeviceLogin(this, new DeviceOAuth(address), new DeviceLogin.Listener() {
+            @Override public void complete(DeviceOAuth.Tokens tokens) {
+                deviceLogin = null;
+                try {
+                    deviceCredentials.install(address, tokens);
+                    deviceAvailable = true;
+                    settings.remove("gateSession");
+                    settings.remove("authorization");
+                    if (persist()) {
+                        notice = "设备登录已加密保存；关闭 App 不退出，服务端最长授权期限由网关控制";
+                        renderState();
+                        if (state.phase == RemoteState.Phase.IDLE) chooseSession();
+                        else connect();
+                    }
+                } catch (IOException | JSONException error) {
+                    storageFailed = true;
+                    notice = "新设备凭据无法可靠保存，已禁止发送；请在 Auth 页检查或撤销设备";
+                    renderState();
+                }
+            }
+            @Override public void failed(String message) {
+                deviceLogin = null;
+                loginFailurePendingResume = !foreground;
+                notice = message;
+                renderState();
+            }
+        });
+        deviceLogin.start();
     }
 
     private void startLogin() {
@@ -811,13 +878,15 @@ public final class MainActivity extends Activity {
                 @Override public void complete(GateSession session) {
                     login = null;
                     try {
+                        deviceCredentials.clear();
+                        deviceAvailable = false;
                         settings.put("gateSession", session.toJSON()).put("authorization", "");
                         if (persist()) {
                             notice = "登录已加密保存；关闭 App 或重启设备不会清除";
                             renderState();
                             connect();
                         }
-                    } catch (JSONException error) {
+                    } catch (IOException | JSONException error) {
                         storageFailed = true;
                         notice = "登录状态无法保存，已禁止发送";
                         renderState();
@@ -841,10 +910,19 @@ public final class MainActivity extends Activity {
         if (!authenticationAvailable() || dialog) return;
         Runnable[] after = new Runnable[1];
         AlertDialog box = new AlertDialog.Builder(this).setTitle("退出本机登录")
-                .setMessage("清除本机保存的 Cookie 和 Authorization，但保留连接设置、草稿与未知发送状态。"
-                        + "不会撤销服务端会话；如需撤销，请在网关管理页操作。关闭 App 无需退出登录。")
+                .setMessage("清除本机保存的设备凭据、Cookie 和 Authorization，但保留连接设置、草稿与未知发送状态。"
+                        + "不会撤销服务端授权；如需撤销设备，请选择服务端撤销或在 Auth 页操作。关闭 App 无需退出登录。")
                 .setPositiveButton("清除本机登录", (d, which) -> {
                     disconnect();
+                    try {
+                        deviceCredentials.clear();
+                        deviceAvailable = false;
+                    } catch (IOException | JSONException error) {
+                        storageFailed = true;
+                        notice = "本机凭据清除未确认，已禁止发送；可在 Auth 页撤销设备";
+                        renderState();
+                        return;
+                    }
                     settings.remove("gateSession");
                     settings.remove("authorization");
                     meta = null;
@@ -855,6 +933,51 @@ public final class MainActivity extends Activity {
                     renderState();
                 }).setNegativeButton("取消", null).create();
         showNavigation(box, after, () -> {});
+    }
+
+    private void confirmRevoke() {
+        if (!authenticationAvailable() || dialog) return;
+        if (!deviceAvailable) {
+            notice = "本机没有设备扫码凭据；Cookie 会话请在网关管理页撤销";
+            renderState();
+            return;
+        }
+        Runnable[] after = new Runnable[1];
+        AlertDialog box = new AlertDialog.Builder(this).setTitle("撤销此设备的服务端授权")
+                .setMessage("确认后向当前站点撤销设备凭据。不会撤回消息或清除草稿。"
+                        + "网络失败不会假称已撤销；可改用仅本机退出，或在 Auth 页远端撤销。")
+                .setPositiveButton("确认撤销", (d, w) -> after[0] = this::revokeDevice)
+                .setNegativeButton("取消", null).create();
+        showNavigation(box, after, () -> {});
+    }
+
+    private void revokeDevice() {
+        if (!authenticationAvailable()) return;
+        String address = settings.optString("address");
+        disconnect();
+        revoking = true;
+        notice = "正在提交一次设备撤销；不会自动重试";
+        renderState();
+        writes.execute(() -> {
+            try {
+                boolean cleared = deviceCredentials.revoke(address, new DeviceOAuth(address));
+                main.post(() -> {
+                    if (isDestroyed()) return;
+                    revoking = false;
+                    deviceAvailable = !cleared;
+                    notice = cleared ? "网关已受理设备撤销；本机设备凭据已清除，草稿保留"
+                            : "网关已受理旧设备撤销；本机登录已变更，未清除新凭据";
+                    renderState();
+                });
+            } catch (IOException | JSONException error) {
+                main.post(() -> {
+                    if (isDestroyed()) return;
+                    revoking = false;
+                    notice = "服务端撤销未确认；设备凭据已停用，不会自动重试。可仅本机退出或在 Auth 页撤销";
+                    renderState();
+                });
+            }
+        });
     }
 
     private EditText input(LinearLayout form, String label, String value, boolean secret) {
@@ -883,7 +1006,8 @@ public final class MainActivity extends Activity {
                 settings.optString("authorization"), true);
         TextView info = text(15, Color.LTGRAY);
         info.setText("会话从列表选择，无需输入 ID；只聊天，不创建或管理会话。\n录音经现有 Speech/Azure 转写并产生费用；不会自动发送。\n"
-                + "原生 Passkey 需 API 28+、兼容凭据提供器和网关适配；扫码入口由系统决定。\n"
+                + "扫码由手机 Passkey 批准；电视无需凭据提供器，需网关支持设备授权。\n"
+                + "更换域名会清除全部旧凭据；新站点的手动 Authorization 请保存域名后再填写。\n"
                 + "有效登录会加密保留，关闭 App / 重启设备不退出登录。\n"
                 + "Android " + Build.VERSION.RELEASE + " / API " + Build.VERSION.SDK_INT
                 + " · USB 实际采音需本机验证");
@@ -891,9 +1015,9 @@ public final class MainActivity extends Activity {
         ScrollView formScroll = new ScrollView(this);
         formScroll.addView(form);
         AlertDialog.Builder builder = new AlertDialog.Builder(this).setTitle(first ? "连接 Cockpit" : "高级连接设置")
-                .setView(formScroll).setPositiveButton(first ? "保存并用 Passkey 登录" : "保存并连接", null)
+                .setView(formScroll).setPositiveButton(first ? "保存并扫码登录" : "保存并连接", null)
                 .setNegativeButton("取消", null);
-        if (!first) builder.setNeutralButton("保存并用 Passkey 登录", null);
+        if (!first) builder.setNeutralButton("保存并扫码登录", null);
         AlertDialog box = builder.create();
         box.setOnShowListener(d -> {
             box.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
@@ -904,17 +1028,27 @@ public final class MainActivity extends Activity {
                     HostClient.validateSettings(url, "settings", auth);
                     url = okhttp3.HttpUrl.get(url).toString();
                     if (!url.equals(settings.optString("address"))) {
+                        deviceCredentials.clear();
+                        deviceAvailable = false;
                         settings.remove("gateSession");
                         settings.remove("sessionId");
+                        auth = "";
                     }
-                    if (!auth.isEmpty()) settings.remove("gateSession");
+                    if (!auth.isEmpty()) {
+                        deviceCredentials.clear();
+                        deviceAvailable = false;
+                        settings.remove("gateSession");
+                    }
                     settings.put("address", url).put("authorization", auth);
                     meta = null; receipt = "";
                     if (persist()) {
                         after[0] = first || v == box.getButton(AlertDialog.BUTTON_NEUTRAL)
-                                ? this::startLogin : this::chooseSession;
+                                ? this::startDeviceLogin : this::chooseSession;
                         box.dismiss();
                     }
+                } catch (IOException error) {
+                    storageFailed = true;
+                    info.setText("旧设备凭据清除未确认，已禁止变更连接");
                 } catch (JSONException | IllegalArgumentException error) { info.setText(safe(error)); }
             };
             box.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(save);

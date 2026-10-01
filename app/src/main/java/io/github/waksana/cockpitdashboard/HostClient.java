@@ -20,6 +20,7 @@ final class HostClient {
     final String sessionId;
     private final String authorization;
     private final GateSession gateSession;
+    private final DeviceCredentials device;
 
     static class Rejected extends IOException {
         Rejected(String message) { super(message); }
@@ -49,10 +50,21 @@ final class HostClient {
     }
 
     HostClient(HttpUrl origin, String sessionId, String authorization, OkHttpClient http, GateSession gateSession) {
+        this(origin, sessionId, authorization, http, gateSession, null);
+    }
+
+    HostClient(String address, String sessionId, String authorization, GateSession gateSession,
+            DeviceCredentials device) {
+        this(HttpUrl.get(address), sessionId, authorization, newHttp(), gateSession, device);
+    }
+
+    HostClient(HttpUrl origin, String sessionId, String authorization, OkHttpClient http,
+            GateSession gateSession, DeviceCredentials device) {
         this.origin = origin;
         this.sessionId = sessionId;
         this.authorization = authorization;
         this.gateSession = gateSession;
+        this.device = device;
         this.http = transport(http);
     }
 
@@ -94,15 +106,19 @@ final class HostClient {
         if (url == null || !url.scheme().equals(origin.scheme()) || !url.host().equals(origin.host())
                 || url.port() != origin.port()) throw new Rejected("拒绝跨站请求");
         Request.Builder builder = new Request.Builder().url(url).header("Accept", "application/json");
-        if (!authorization.isEmpty()) builder.header("Authorization", authorization);
-        if (gateSession != null) builder.header("Cookie", gateSession.header(url, System.currentTimeMillis()));
+        if (device != null) {
+            builder.header("Authorization", device.header(url, token -> new DeviceOAuth(origin, http).refresh(token)));
+        } else {
+            if (!authorization.isEmpty()) builder.header("Authorization", authorization);
+            if (gateSession != null) builder.header("Cookie", gateSession.header(url, System.currentTimeMillis()));
+        }
         if (body != null) builder.post(RequestBody.create(body.toString(), JSON));
         try (Response response = http.newCall(builder.build()).execute()) {
             HttpUrl redirect = response.header("Location") == null ? null : url.resolve(response.header("Location"));
             if (response.code() == 401 || (response.isRedirect() && redirect != null
                     && redirect.scheme().equals(origin.scheme()) && redirect.host().equals(origin.host())
                     && redirect.port() == origin.port() && redirect.encodedPath().equals("/_gate/login"))) {
-                throw new AuthenticationRequired("网关要求登录：按返回键选择 Passkey 登录，或检查 Authorization");
+                throw new AuthenticationRequired("网关要求登录：按返回键选择扫码登录，或检查 Authorization");
             }
             // A proxy/5xx can fail after the mutation reached the host; never call it rejected.
             if (!response.isSuccessful()) {

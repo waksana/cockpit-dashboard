@@ -119,7 +119,7 @@ public class SessionDirectoryTest {
             assertFalse(settings.has("sessionId"));
             AlertDialog dialog = ShadowAlertDialog.getLatestAlertDialog();
             assertNotNull(dialog);
-            assertEquals("保存并用 Passkey 登录", dialog.getButton(AlertDialog.BUTTON_POSITIVE).getText().toString());
+            assertEquals("保存并扫码登录", dialog.getButton(AlertDialog.BUTTON_POSITIVE).getText().toString());
             assertEquals(1, inputCount(dialog.getWindow().getDecorView()));
         }
     }

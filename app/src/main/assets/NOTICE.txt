@@ -16,6 +16,9 @@ https://android.googlesource.com/platform/frameworks/support/
 Markwon 4.6.2: Copyright Dimitry Ivanov.
 https://github.com/noties/Markwon
 
+ZXing core 3.5.3 (local QR encoding only): Copyright ZXing authors.
+https://github.com/zxing/zxing
+
 The projects above are distributed under the Apache License, Version 2.0,
 included in Apache-2.0.txt in this application's assets.
 
