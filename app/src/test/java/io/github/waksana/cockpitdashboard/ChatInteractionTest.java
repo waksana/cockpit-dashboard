@@ -300,6 +300,28 @@ public class ChatInteractionTest {
         }
     }
 
+    @Test public void signerReportsRetainTwoBoundedAttemptsAcrossRestartOutsideChat() throws Exception {
+        try (ActivityController<MainActivity> controller = Robolectric.buildActivity(MainActivity.class).create()) {
+            MainActivity activity = controller.get();
+            Field listenerField = AppUpdater.class.getDeclaredField("listener");
+            listenerField.setAccessible(true);
+            AppUpdater.Listener listener = (AppUpdater.Listener) listenerField.get(field(activity, "updater"));
+            listener.diagnostic("attempt=first");
+            listener.diagnostic("attempt=second");
+            listener.diagnostic("attempt=third\n" + new String(new char[7000]).replace('\0', 'x'));
+            JSONArray reports = ((JSONObject) field(activity, "settings")).getJSONArray("updateSignerReports");
+            assertEquals(2, reports.length());
+            assertEquals("attempt=second", reports.getString(0));
+            assertEquals(6000, reports.getString(1).length());
+            assertFalse(((TextView) field(activity, "status")).getText().toString().contains("attempt="));
+        }
+        try (ActivityController<MainActivity> controller = Robolectric.buildActivity(MainActivity.class).create()) {
+            JSONArray reports = ((JSONObject) field(controller.get(), "settings")).getJSONArray("updateSignerReports");
+            assertEquals(2, reports.length());
+            assertTrue(reports.getString(1).startsWith("attempt=third"));
+        }
+    }
+
     @Test public void updateDiagnosticsAreBoundedPersistedAndAbsentFromChatUnlessFailed() throws Exception {
         try (ActivityController<MainActivity> controller = Robolectric.buildActivity(MainActivity.class).create()) {
             MainActivity activity = controller.get();

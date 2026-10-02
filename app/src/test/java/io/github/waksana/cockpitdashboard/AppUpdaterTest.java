@@ -57,6 +57,7 @@ public class AppUpdaterTest {
     private boolean ready = true;
     private final List<String> statuses = new ArrayList<>();
     private final List<String> failures = new ArrayList<>();
+    private final List<String> diagnostics = new ArrayList<>();
     private UpdateClient.Update update;
 
     public static class TestActivity extends Activity {
@@ -99,6 +100,7 @@ public class AppUpdaterTest {
             @Override public boolean isReady() { return ready; }
             @Override public void status(String message) { statuses.add(message); }
             @Override public void failure(String message) { failures.add(message); statuses.add(message); }
+            @Override public void diagnostic(String report) { diagnostics.add(report); }
         }, client);
         updater.resume();
     }
@@ -407,11 +409,76 @@ public class AppUpdaterTest {
         assertFalse(notice.contains("secret"));
         assertFalse(notice.contains("https://"));
         assertNull(shadowOf(activity).getNextStartedActivity());
-        assertEquals(1, ShadowLog.getLogsForTag("DashboardUpdater").size());
-        assertNull(ShadowLog.getLogsForTag("DashboardUpdater").get(0).throwable);
-        assertFalse(ShadowLog.getLogsForTag("DashboardUpdater").get(0).msg.contains("secret"));
+        assertFalse(ShadowLog.getLogsForTag("DashboardUpdater").isEmpty());
+        for (ShadowLog.LogItem log : ShadowLog.getLogsForTag("DashboardUpdater")) {
+            assertNull(log.throwable);
+            assertFalse(log.msg.contains("secret"));
+            assertFalse(log.msg.contains("https://"));
+        }
+        assertEquals(1, diagnostics.size());
         updater.presentIfReady();
         assertFalse(updater.isBusy());
+    }
+
+    @Test public void missingModernSignerStillFailsClosedAndPublishesSeparateReport() throws Exception {
+        File apk = stageVerified();
+        PackageInfo archive = packageInfo(activity.getPackageName(), update.versionCode, 23, "01");
+        archive.signingInfo = null;
+        shadowOf(activity.getPackageManager()).setPackageArchiveInfo(apk.getAbsolutePath(), archive);
+        updater.presentIfReady();
+        ShadowAlertDialog.getLatestAlertDialog().getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+        await(() -> !updater.isBusy());
+        assertEquals(1, diagnostics.size());
+        assertTrue(diagnostics.get(0).contains("SIGNER_MISSING"));
+        assertTrue(statuses.get(statuses.size() - 1).contains("APK_SIGNER/SIGNER_MISSING"));
+        assertNull(shadowOf(activity).getNextStartedActivity());
+        assertFalse(apk.exists());
+    }
+
+    @Test public void explicitProbeDownloadsEvenCurrentVersionButNeverInstallsOrTouchesVerifiedApk() throws Exception {
+        byte[] release = UpdateClientTest.bytes(UpdateClientTest.release());
+        byte[] manifest = UpdateClientTest.bytes(UpdateClientTest.manifest());
+        AtomicInteger requests = new AtomicInteger();
+        create(synthetic(chain -> {
+            int request = requests.getAndIncrement();
+            return response(chain, request == 0 ? release : request == 1 ? manifest : UpdateClientTest.APK_BYTES);
+        }));
+        PackageInfo installed = packageInfo(activity.getPackageName(), update.versionCode, 23, "01");
+        shadowOf(activity.getPackageManager()).installPackage(installed);
+        File probe = new File(activity.getCacheDir(), "update-diagnostic/updates/" + UpdateClient.APK);
+        shadowOf(activity.getPackageManager()).setPackageArchiveInfo(probe.getAbsolutePath(), installed);
+        File installer = new File(activity.getFilesDir(), "keep-installer.apk");
+        Files.write(installer.toPath(), new byte[]{1, 2, 3});
+        field("verified", installer);
+        updater.diagnose();
+        await(() -> !updater.isBusy());
+        assertEquals(3, requests.get());
+        assertEquals(1, diagnostics.size());
+        assertTrue(diagnostics.get(0).contains("NOT_NEWER"));
+        assertTrue(diagnostics.get(0).contains("DIAGNOSTIC_LATEST"));
+        assertNull(shadowOf(activity).getNextStartedActivity());
+        assertArrayEquals(new byte[]{1, 2, 3}, Files.readAllBytes(installer.toPath()));
+        assertFalse(probe.exists());
+        assertTrue(installer.delete());
+    }
+
+    @Test public void cancelledExplicitProbeCannotPublishLateReport() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
+        create(synthetic(chain -> {
+            entered.countDown();
+            try { release.await(3, TimeUnit.SECONDS); }
+            catch (InterruptedException error) { Thread.currentThread().interrupt(); }
+            throw new IOException("private signed URL");
+        }));
+        updater.diagnose();
+        assertTrue(entered.await(2, TimeUnit.SECONDS));
+        updater.pause();
+        release.countDown();
+        Thread.sleep(80);
+        shadowOf(Looper.getMainLooper()).idle();
+        assertTrue(diagnostics.isEmpty());
+        assertTrue(ShadowLog.getLogsForTag("DashboardUpdater").isEmpty());
+        assertNull(shadowOf(activity).getNextStartedActivity());
     }
 
     @Test public void systemArchiveParseFailureIsNotBlamedOnSignatureAndDeletesFile() throws Exception {

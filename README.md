@@ -314,6 +314,32 @@ Logs omit response bodies, URLs, credentials, exception text and stack traces.
 Cancellation does not emit a late failure log. These diagnostics do not establish
 the cause of a previously observed device failure.
 
+For `APK_SIGNER/SIGNER_MISSING`, use **Operation instructions and diagnostics >
+Collect signer diagnostics** and explicitly confirm the download. This fetches
+the latest official APK even when the installed app is already current, using a
+separate private probe file. It never invokes the installer or authorizes an
+update. **View signer reports** retains the last two bounded reports (6,000
+characters each) in encrypted settings; scroll and photograph the report,
+including its `attempt` identifier. Reports are not uploaded automatically.
+
+Each normal download/install verification also captures an attempt report:
+device API and bounded manufacturer/model/firmware labels, app/target version,
+file hash/size verification, installed versus archive package observations,
+modern `SigningInfo` presence, signer/history array shape, certificate SHA-256
+fingerprints and diagnostic-only legacy `GET_SIGNATURES` results. Null, empty,
+null-entry and multiple-signer cases remain distinct. Paths, serial numbers,
+credentials, exception messages and conversation/audio content are excluded.
+Cancellation suppresses late reports. Routine status cannot evict these reports.
+
+Legacy lookup is **not** an installation fallback: an empty modern signing
+result still fails closed even if the legacy probe finds a certificate.
+`DIAGNOSTIC_LATEST` can end in `VERSION/NOT_NEWER` when probing the currently
+installed release; that is an expected version restriction, not proof of signer
+validation. Compare modern/legacy observations to distinguish interface behavior
+from missing signer data, then reproduce with the same attempt's hash and
+version. Neither the probe nor a successful download establishes a GMUI root
+cause or successful device installation.
+
 Confirm downloading, then confirm opening Android's installer. Android 8+ may
 first require allowing this app to install unknown apps; returning from settings
 still requires confirmation. This is not a silent installer and an installer

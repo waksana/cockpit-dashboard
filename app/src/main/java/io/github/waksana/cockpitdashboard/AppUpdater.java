@@ -34,6 +34,8 @@ public final class AppUpdater {
         /** Non-blocking, credential-free status; must not open a dialog. */
         void status(String message);
         default void failure(String message) { status(message); }
+        /** Bounded, sanitized report. Never a success receipt or authorization to install. */
+        default void diagnostic(String report) {}
     }
 
     private final Activity activity;
@@ -224,14 +226,16 @@ public final class AppUpdater {
         if (busy || update == null) return;
         UpdateClient.Update selected = update;
         UpdateClient.Cancellation operation = begin();
+        UpdateDiagnostics diagnostics = new UpdateDiagnostics("DOWNLOAD", selected.versionCode);
         status("正在下载并校验更新；离开应用会中断下载。");
         worker.execute(() -> {
             File downloaded = null;
             try {
                 downloaded = client.download(selected, activity.getFilesDir(), operation);
-                validateArchive(downloaded, selected, operation);
+                validateArchive(downloaded, selected, operation, diagnostics);
                 File result = downloaded;
                 finish(operation, () -> {
+                    publishDiagnostics(diagnostics, null);
                     verified = result;
                     status("更新已校验，请确认安装。");
                     presentIfReady();
@@ -239,6 +243,7 @@ public final class AppUpdater {
             } catch (IOException | PackageManager.NameNotFoundException | IllegalArgumentException | SecurityException error) {
                 if (downloaded != null) downloaded.delete();
                 finish(operation, () -> {
+                    publishDiagnostics(diagnostics, UpdateFailure.at(APK_DOWNLOAD, error));
                     verified = null;
                     deferred = true;
                     failure("更新下载或安全校验失败，未安装。", APK_DOWNLOAD, error, selected);
@@ -276,11 +281,13 @@ public final class AppUpdater {
         UpdateClient.Update selected = update;
         File apk = verified;
         UpdateClient.Cancellation operation = begin();
+        UpdateDiagnostics diagnostics = new UpdateDiagnostics("INSTALL", selected.versionCode);
         status("正在再次校验安装文件…");
         worker.execute(() -> {
             try {
-                validateArchive(apk, selected, operation);
+                validateArchive(apk, selected, operation, diagnostics);
                 finish(operation, () -> {
+                    publishDiagnostics(diagnostics, null);
                     if (!ready() || !canInstall()) {
                         status("尚未安装；请在应用空闲且允许安装来源后再次确认。");
                         return;
@@ -300,12 +307,57 @@ public final class AppUpdater {
             } catch (IOException | PackageManager.NameNotFoundException | IllegalArgumentException | SecurityException error) {
                 apk.delete();
                 finish(operation, () -> {
+                    publishDiagnostics(diagnostics, UpdateFailure.at(FILE_VERIFY, error));
                     verified = null;
                     update = null;
                     failure("安装前安全校验失败，未安装。请重新检查更新。", FILE_VERIFY, error, selected);
                 });
             }
         });
+    }
+
+    /** Explicit probe of the latest release, even when already current. No installer state is changed. */
+    public void diagnose() {
+        if (!ready() || busy || dialog != null) {
+            status("当前操作尚未结束，请返回聊天空闲后再次采集诊断。");
+            return;
+        }
+        UpdateClient.Cancellation operation = begin();
+        status("正在采集升级签名诊断；会下载官方 APK，但不会安装。");
+        worker.execute(() -> {
+            UpdateDiagnostics diagnostics = new UpdateDiagnostics("DIAGNOSTIC_LATEST", 0);
+            File downloaded = null;
+            UpdateFailure failure = null;
+            File directory = new File(activity.getCacheDir(), "update-diagnostic");
+            try {
+                UpdateClient.Update selected = client.check(0, operation);
+                if (selected == null) throw new UpdateFailure(MANIFEST, UpdateFailure.Reason.NOT_FOUND);
+                diagnostics = new UpdateDiagnostics("DIAGNOSTIC_LATEST", selected.versionCode);
+                downloaded = client.download(selected, directory, operation);
+                validateArchive(downloaded, selected, operation, diagnostics);
+            } catch (IOException | PackageManager.NameNotFoundException | IllegalArgumentException | SecurityException error) {
+                failure = UpdateFailure.at(RELEASE, error);
+            } finally {
+                // Only this probe's private file; never the updater's verified installer APK.
+                if (downloaded != null && !downloaded.delete() && downloaded.exists()) {
+                    failure = new UpdateFailure(APK_STORAGE, UpdateFailure.Reason.STORAGE);
+                }
+            }
+            UpdateDiagnostics report = diagnostics;
+            UpdateFailure outcome = failure;
+            finish(operation, () -> {
+                publishDiagnostics(report, outcome);
+                status("升级诊断已记录，请打开设置「操作说明与诊断」；未安装。", outcome != null
+                        && outcome.reason != UpdateFailure.Reason.NOT_NEWER);
+            });
+        });
+    }
+
+    private void publishDiagnostics(UpdateDiagnostics diagnostics, UpdateFailure failure) {
+        diagnostics.result(failure);
+        String report = diagnostics.describe();
+        for (String line : report.split("\n")) Log.i("DashboardUpdater", line);
+        listener.diagnostic(report);
     }
 
     static Intent installerIntent(Activity activity, File apk) {
@@ -325,15 +377,19 @@ public final class AppUpdater {
     }
 
     @SuppressWarnings("deprecation")
-    private void validateArchive(File apk, UpdateClient.Update selected, UpdateClient.Cancellation operation)
+    private void validateArchive(File apk, UpdateClient.Update selected, UpdateClient.Cancellation operation,
+            UpdateDiagnostics diagnostics)
             throws IOException, PackageManager.NameNotFoundException {
         UpdateFailure.Stage stage = FILE_VERIFY;
         try {
             UpdateClient.verifyFile(apk, selected, operation);
+            diagnostics.fileVerified(apk, selected.sha256);
             stage = APK_PARSE;
             PackageInfo archive = activity.getPackageManager().getPackageArchiveInfo(apk.getAbsolutePath(),
                     Build.VERSION.SDK_INT >= 28 ? PackageManager.GET_SIGNING_CERTIFICATES : PackageManager.GET_SIGNATURES);
-            validatePackages(activity.getPackageName(), installedPackage(), archive, selected, Build.VERSION.SDK_INT);
+            PackageInfo installed = installedPackage();
+            diagnostics.packages(activity.getPackageManager(), activity.getPackageName(), apk, installed, archive, operation);
+            validatePackages(activity.getPackageName(), installed, archive, selected, Build.VERSION.SDK_INT);
             if (Build.VERSION.SDK_INT < 24) {
                 stage = MIN_SDK;
                 int minimum = minSdkFromApk(apk, operation);

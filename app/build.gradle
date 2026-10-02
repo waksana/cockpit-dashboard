@@ -11,6 +11,7 @@ def signingValues = ['DASHBOARD_KEYSTORE', 'DASHBOARD_STORE_PASSWORD', 'DASHBOAR
 android {
     namespace 'io.github.waksana.cockpitdashboard'
     compileSdk 35
+    buildFeatures { buildConfig true }
     defaultConfig {
         applicationId 'io.github.waksana.cockpitdashboard'
         minSdk 23
