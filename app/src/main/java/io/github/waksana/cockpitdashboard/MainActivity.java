@@ -114,6 +114,24 @@ public final class MainActivity extends Activity {
                 updateNotice = "应用更新失败，详情见设置「操作说明与诊断」";
                 renderState();
             }
+            @Override public void diagnostic(String report) {
+                if (storageFailed) return;
+                JSONArray prior = settings.optJSONArray("updateSignerReports");
+                JSONArray reports = new JSONArray();
+                if (prior != null && prior.length() > 0) {
+                    String last = prior.optString(prior.length() - 1);
+                    reports.put(last.substring(0, Math.min(last.length(), 6000)));
+                }
+                reports.put(report.substring(0, Math.min(report.length(), 6000)));
+                try {
+                    settings.put("updateSignerReports", reports);
+                    persist();
+                } catch (JSONException error) {
+                    storageFailed = true;
+                    notice = "签名诊断无法保存，已禁止发送";
+                    renderState();
+                }
+            }
         });
     }
 
@@ -877,9 +895,45 @@ public final class MainActivity extends Activity {
         body.setText(contents.toString());
         ScrollView container = new ScrollView(this);
         container.addView(body);
+        Runnable[] after = new Runnable[1];
         AlertDialog box = new AlertDialog.Builder(this).setTitle("操作说明与诊断")
+                .setView(container).setPositiveButton("返回", null)
+                .setNeutralButton("查看签名报告", (d, w) -> after[0] = this::showSignerReports)
+                .setNegativeButton("采集签名诊断", (d, w) -> after[0] = this::confirmSignerDiagnostic).create();
+        showNavigation(box, after, () -> {});
+    }
+
+    private void confirmSignerDiagnostic() {
+        Runnable[] after = new Runnable[1];
+        AlertDialog box = new AlertDialog.Builder(this).setTitle("采集升级签名诊断")
+                .setMessage("将下载最新官方 APK 并比较系统新旧签名接口，即使已是最新版也可采集。"
+                        + "\n不会安装、不会降低安全校验、不会上传数据。请留在前台直至完成，再查看签名报告并拍照回传。")
+                .setPositiveButton("下载并采集", (d, w) -> after[0] = () -> updater.diagnose())
+                .setNegativeButton("取消", null).create();
+        showNavigation(box, after, () -> {});
+    }
+
+    private void showSignerReports() {
+        StringBuilder text = new StringBuilder("签名读取诊断（最近 2 次，最新在前）\n"
+                + "请上下滚动拍照，保留 attempt 编号以关联同一次采集。\n"
+                + "NULL=系统未返回；size=数组长度；nullEntries=空元素数。\n"
+                + "primary=安全校验使用的接口；legacy=旧接口旁路探测，不放行安装。\n"
+                + "同版本采集出现 NOT_NEWER 属正常版本限制，不代表签名检查通过。\n\n");
+        JSONArray reports = settings.optJSONArray("updateSignerReports");
+        if (reports == null || reports.length() == 0) text.append("暂无报告，请先采集签名诊断。");
+        else for (int i = reports.length() - 1; i >= Math.max(0, reports.length() - 2); i--) {
+            String report = reports.optString(i);
+            text.append(report, 0, Math.min(report.length(), 6000)).append("\n\n");
+        }
+        TextView body = text(20, Color.WHITE);
+        body.setText(text.toString());
+        ScrollView container = new ScrollView(this);
+        container.setFocusable(true);
+        container.addView(body);
+        AlertDialog box = new AlertDialog.Builder(this).setTitle("升级签名诊断报告")
                 .setView(container).setPositiveButton("返回", null).create();
         showNavigation(box, new Runnable[1], () -> {});
+        container.requestFocus();
     }
 
     private void showNavigation(AlertDialog box, Runnable[] after, Runnable cleanup) {
