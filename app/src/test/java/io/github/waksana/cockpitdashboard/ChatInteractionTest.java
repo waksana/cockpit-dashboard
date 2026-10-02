@@ -8,6 +8,10 @@ import android.view.ViewGroup;
 import android.widget.TextView;
 import android.widget.HorizontalScrollView;
 import android.content.Intent;
+import android.graphics.Rect;
+import android.text.Spanned;
+import android.text.style.BackgroundColorSpan;
+import android.widget.ScrollView;
 import java.time.Duration;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -161,6 +165,10 @@ public class ChatInteractionTest {
             assertTrue(navigation.active());
             assertNull(shadowOf(activity).getNextStartedActivity());
             key(activity, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_DOWN);
+            Spanned links = (Spanned) ((TextView) body.getChildAt(0)).getText();
+            BackgroundColorSpan[] selected = links.getSpans(0, links.length(), BackgroundColorSpan.class);
+            assertEquals(1, selected.length);
+            assertEquals(links.toString().indexOf("Second"), links.getSpanStart(selected[0]));
             shortConfirm(activity);
             Intent opened = shadowOf(activity).getNextStartedActivity();
             assertNotNull(opened);
@@ -205,6 +213,43 @@ public class ChatInteractionTest {
             renderMessages.setAccessible(true);
             renderMessages.invoke(activity, false);
             assertFalse(navigation.active());
+        }
+    }
+
+    @Test public void readingHighlightsExactLinkAndScrollsItsLineInsteadOfWholeLongMessage() throws Exception {
+        try (ActivityController<MainActivity> controller = Robolectric.buildActivity(MainActivity.class).create()) {
+            MainActivity activity = controller.get();
+            set(activity, "foreground", true);
+            ViewGroup conversation = (ViewGroup) field(activity, "conversation");
+            conversation.removeAllViews();
+            StringBuilder markdown = new StringBuilder("[First](https://example.com/first)\n");
+            for (int i = 0; i < 60; i++) markdown.append("Ordinary line ").append(i).append('\n');
+            markdown.append("[Last](https://example.com/last)");
+            ViewGroup body = (ViewGroup) new ChatMarkdown(activity).render(markdown.toString());
+            conversation.addView(body);
+            layout(activity);
+            shortConfirm(activity);
+            key(activity, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_DOWN);
+            TextView text = (TextView) body.getChildAt(0);
+            assertFalse(text.isFocused());
+            Spanned value = (Spanned) text.getText();
+            BackgroundColorSpan[] selected = value.getSpans(0, value.length(), BackgroundColorSpan.class);
+            assertEquals(1, selected.length);
+            int start = value.getSpanStart(selected[0]);
+            assertEquals(value.toString().indexOf("Last"), start);
+            ScrollView scroll = (ScrollView) field(activity, "scroll");
+            assertTrue(scroll.getScrollY() > 0);
+            int line = text.getLayout().getLineForOffset(start);
+            Rect targetLine = new Rect(0, text.getTotalPaddingTop() + text.getLayout().getLineTop(line), 1,
+                    text.getTotalPaddingTop() + text.getLayout().getLineBottom(line));
+            scroll.offsetDescendantRectToMyCoords(text, targetLine);
+            assertTrue(targetLine.top >= scroll.getScrollY());
+            assertTrue(targetLine.bottom <= scroll.getScrollY() + scroll.getHeight());
+            key(activity, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_BACK);
+            assertEquals(0, value.getSpans(0, value.length(), BackgroundColorSpan.class).length);
+            shortConfirm(activity);
+            assertEquals(value.toString().indexOf("Last"),
+                    value.getSpanStart(value.getSpans(0, value.length(), BackgroundColorSpan.class)[0]));
         }
     }
 

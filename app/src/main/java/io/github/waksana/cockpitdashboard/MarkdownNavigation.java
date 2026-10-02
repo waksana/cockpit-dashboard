@@ -2,11 +2,14 @@ package io.github.waksana.cockpitdashboard;
 
 import android.graphics.Color;
 import android.graphics.Rect;
+import android.graphics.RectF;
+import android.graphics.Path;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
-import android.text.Selection;
+import android.text.Layout;
 import android.text.Spannable;
 import android.text.Spanned;
+import android.text.style.BackgroundColorSpan;
 import android.text.style.ClickableSpan;
 import android.view.View;
 import android.view.ViewGroup;
@@ -29,6 +32,7 @@ final class MarkdownNavigation {
     private int selected = -1;
     private Drawable priorForeground;
     private ViewGroup root;
+    private BackgroundColorSpan selectedLink;
 
     boolean active() { return selected >= 0; }
 
@@ -42,9 +46,8 @@ final class MarkdownNavigation {
         controls.clear();
         root = conversation;
         collect(conversation);
-        Rect bounds = new Rect();
         for (int i = 0; i < controls.size(); i++) {
-            if (controls.get(i).view.getGlobalVisibleRect(bounds)) {
+            if (visible(controls.get(i))) {
                 select(i);
                 return true;
             }
@@ -87,30 +90,59 @@ final class MarkdownNavigation {
         selected = index;
         Control control = controls.get(index);
         priorForeground = control.view.getForeground();
-        GradientDrawable outline = new GradientDrawable();
-        outline.setColor(Color.TRANSPARENT);
-        outline.setStroke(Math.max(2, Math.round(2 * control.view.getResources().getDisplayMetrics().density)),
-                Color.rgb(254, 214, 123));
-        control.view.setForeground(outline);
         if (control.link != null) {
             TextView text = (TextView) control.view;
             if (text.getText() instanceof Spannable) {
                 Spannable value = (Spannable) text.getText();
-                Selection.setSelection(value, value.getSpanStart(control.link), value.getSpanEnd(control.link));
+                selectedLink = new BackgroundColorSpan(Color.rgb(80, 69, 35));
+                value.setSpan(selectedLink, value.getSpanStart(control.link), value.getSpanEnd(control.link),
+                        Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
             }
+        } else {
+            GradientDrawable outline = new GradientDrawable();
+            outline.setColor(Color.TRANSPARENT);
+            outline.setStroke(Math.max(2, Math.round(2 * control.view.getResources().getDisplayMetrics().density)),
+                    Color.rgb(254, 214, 123));
+            control.view.setForeground(outline);
         }
-        Rect bounds = new Rect();
-        control.view.getDrawingRect(bounds);
-        control.view.requestRectangleOnScreen(bounds, true);
+        control.view.requestRectangleOnScreen(bounds(control), true);
     }
 
     private void unpaint() {
         if (!active()) return;
         View view = controls.get(selected).view;
         view.setForeground(priorForeground);
-        if (view instanceof TextView && ((TextView) view).getText() instanceof Spannable)
-            Selection.removeSelection((Spannable) ((TextView) view).getText());
+        if (selectedLink != null && view instanceof TextView && ((TextView) view).getText() instanceof Spannable)
+            ((Spannable) ((TextView) view).getText()).removeSpan(selectedLink);
+        selectedLink = null;
         priorForeground = null;
+    }
+
+    private static Rect bounds(Control control) {
+        Rect bounds = new Rect();
+        control.view.getDrawingRect(bounds);
+        if (control.link == null) return bounds;
+        TextView view = (TextView) control.view;
+        Layout layout = view.getLayout();
+        if (layout == null) return bounds;
+        Spanned text = (Spanned) view.getText();
+        int start = text.getSpanStart(control.link), end = text.getSpanEnd(control.link);
+        int line = layout.getLineForOffset(start);
+        Path selection = new Path();
+        layout.getSelectionPath(start, Math.min(end, layout.getLineEnd(line)), selection);
+        RectF span = new RectF();
+        selection.computeBounds(span, true);
+        int left = view.getTotalPaddingLeft() - view.getScrollX();
+        int top = view.getTotalPaddingTop() - view.getScrollY();
+        bounds.set(left + (int) Math.floor(span.left), top + layout.getLineTop(line),
+                left + Math.max((int) Math.floor(span.left) + 1, (int) Math.ceil(span.right)),
+                top + layout.getLineBottom(line));
+        return bounds;
+    }
+
+    private static boolean visible(Control control) {
+        Rect clipped = new Rect();
+        return control.view.getLocalVisibleRect(clipped) && Rect.intersects(bounds(control), clipped);
     }
 
     private void collect(View view) {
