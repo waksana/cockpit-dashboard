@@ -703,7 +703,7 @@ public final class MainActivity extends Activity {
         disconnect();
         final int epoch = connectionEpoch;
         busyRead = true;
-        notice = "正在读取全部会话…";
+        notice = "正在读取 assistant 角色会话…";
         renderState();
         final HostClient directoryClient;
         try {
@@ -719,7 +719,7 @@ public final class MainActivity extends Activity {
         }
         Runnable[] after = new Runnable[1];
         AlertDialog loading = new AlertDialog.Builder(this).setTitle("正在读取会话")
-                .setMessage("只读取会话目录，不会加载会话。")
+                .setMessage("只显示已配置 assistant 角色的会话；读取目录不会加载会话。")
                 .setNegativeButton("取消", null).create();
         showNavigation(loading, after, () -> {
             connectionEpoch++;
@@ -762,11 +762,13 @@ public final class MainActivity extends Activity {
         String[] labels = new String[page.entries.size()];
         for (int i = 0; i < labels.length; i++) labels[i] = page.entries.get(i).label(settings.optString("sessionId"));
         AlertDialog.Builder builder = new AlertDialog.Builder(this)
-                .setTitle("选择会话 · 第 " + (previous.size() + 1) + " 页")
+                .setTitle("assistant 会话 · 第 " + (previous.size() + 1) + " 页")
                 .setNegativeButton("返回聊天", (d, w) -> after[0] = () -> {
                     if (!settings.optString("sessionId").isEmpty()) connect();
                 });
-        if (labels.length == 0) builder.setMessage("此页没有会话；请在 Cockpit 创建会话后重新读取。");
+        if (labels.length == 0) builder.setMessage(page.next != null
+                ? "此页没有配置 assistant 角色的会话，请查看下一页。"
+                : "此页没有配置 assistant 角色的会话；可在 Cockpit 配置角色后重新读取。");
         else builder.setItems(labels, (d, which) -> after[0] = () -> selectSession(page.entries.get(which)));
         if (page.next != null) {
             builder.setPositiveButton("下一页", (d, w) -> {

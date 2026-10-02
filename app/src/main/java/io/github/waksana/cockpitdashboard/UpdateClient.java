@@ -20,6 +20,8 @@ import okhttp3.Response;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
+import static io.github.waksana.cockpitdashboard.UpdateFailure.Stage.*;
+import static io.github.waksana.cockpitdashboard.UpdateFailure.Reason.*;
 
 /** Public release traffic has its own credential-free transport, unrelated to the host client. */
 final class UpdateClient {
@@ -85,7 +87,7 @@ final class UpdateClient {
 
     Update check(long installedCode, Cancellation cancellation) throws IOException {
         try {
-            JSONObject release = json(read(HttpUrl.get(LATEST), MAX_API, false, cancellation));
+            JSONObject release = json(read(HttpUrl.get(LATEST), MAX_API, false, cancellation, RELEASE));
             if (!Boolean.FALSE.equals(release.get("draft")) || !Boolean.FALSE.equals(release.get("prerelease"))) {
                 throw new IOException("Not a stable release");
             }
@@ -107,17 +109,19 @@ final class UpdateClient {
                 }
             }
             if (!manifestFound || !apkFound) throw new IOException("Release assets missing");
-            Update update = parseManifest(read(assetUrl(tag, "update.json"), MAX_MANIFEST, true, cancellation), tag);
+            Update update = parseManifest(read(assetUrl(tag, "update.json"), MAX_MANIFEST, true, cancellation, MANIFEST), tag);
             return update.versionCode > installedCode ? update : null;
-        } catch (JSONException | IllegalArgumentException error) {
-            throw new IOException("Invalid release metadata");
+        } catch (UpdateFailure error) {
+            throw error;
+        } catch (JSONException | IllegalArgumentException | IOException error) {
+            throw new UpdateFailure(RELEASE, METADATA);
         }
     }
 
     static Update parseManifest(byte[] bytes, String tag) throws IOException {
-        if (bytes.length > MAX_MANIFEST) throw new IOException("Manifest too large");
-        validateTag(tag);
+        if (bytes.length > MAX_MANIFEST) throw new UpdateFailure(MANIFEST, TOO_LARGE);
         try {
+            validateTag(tag);
             JSONObject manifest = json(bytes);
             long code = positiveInteger(manifest.get("versionCode"));
             long size = positiveInteger(manifest.get("size"));
@@ -128,8 +132,8 @@ final class UpdateClient {
                 throw new IOException("Invalid update manifest");
             }
             return new Update((int) code, version, digest, size, tag);
-        } catch (JSONException error) {
-            throw new IOException("Invalid update manifest");
+        } catch (JSONException | IOException error) {
+            throw new UpdateFailure(MANIFEST, METADATA);
         }
     }
 
@@ -175,7 +179,8 @@ final class UpdateClient {
                 || next.host().equals("github-releases.githubusercontent.com");
     }
 
-    private Response open(HttpUrl original, boolean redirects, Cancellation cancellation) throws IOException {
+    private Response open(HttpUrl original, boolean redirects, Cancellation cancellation, UpdateFailure.Stage stage)
+            throws IOException {
         HttpUrl current = original;
         for (int count = 0; count <= MAX_REDIRECTS; count++) {
             cancellation.check();
@@ -191,30 +196,41 @@ final class UpdateClient {
                 String location = response.header("Location");
                 HttpUrl next = location == null ? null : current.resolve(location);
                 response.close();
-                if (next == null || !allowedRedirect(next, original)) throw new IOException("Unsafe release redirect");
+                if (next == null || !allowedRedirect(next, original)) throw new UpdateFailure(stage, REDIRECT);
                 current = next;
             } else {
+                int status = response.code();
+                boolean redirect = response.isRedirect();
                 response.close();
-                throw new IOException("Release request failed");
+                if (redirect) throw new UpdateFailure(stage, redirects ? REDIRECT_LIMIT : REDIRECT);
+                throw UpdateFailure.http(stage, status);
             }
         }
-        throw new IOException("Too many redirects");
+        throw new UpdateFailure(stage, REDIRECT_LIMIT);
     }
 
-    private byte[] read(HttpUrl url, int limit, boolean redirects, Cancellation cancellation) throws IOException {
-        try (Response response = open(url, redirects, cancellation)) {
-            if (response.body().contentLength() > limit) throw new IOException("Release response too large");
-            return boundedRead(response.body().byteStream(), limit, cancellation);
+    private byte[] read(HttpUrl url, int limit, boolean redirects, Cancellation cancellation, UpdateFailure.Stage stage)
+            throws IOException {
+        try (Response response = open(url, redirects, cancellation, stage)) {
+            if (response.body().contentLength() > limit) throw new UpdateFailure(stage, TOO_LARGE);
+            return boundedRead(response.body().byteStream(), limit, cancellation, stage);
+        } catch (IOException | IllegalArgumentException | SecurityException error) {
+            throw UpdateFailure.at(stage, error);
         }
     }
 
     static byte[] boundedRead(InputStream input, int limit, Cancellation cancellation) throws IOException {
+        return boundedRead(input, limit, cancellation, UpdateFailure.Stage.MIN_SDK);
+    }
+
+    private static byte[] boundedRead(InputStream input, int limit, Cancellation cancellation, UpdateFailure.Stage stage)
+            throws IOException {
         ByteArrayOutputStream output = new ByteArrayOutputStream();
         byte[] buffer = new byte[8192];
         int count;
         while ((count = input.read(buffer)) != -1) {
             cancellation.check();
-            if ((long) output.size() + count > limit) throw new IOException("Response too large");
+            if ((long) output.size() + count > limit) throw new UpdateFailure(stage, TOO_LARGE);
             output.write(buffer, 0, count);
         }
         cancellation.check();
@@ -222,37 +238,49 @@ final class UpdateClient {
     }
 
     File download(Update update, File filesDirectory, Cancellation cancellation) throws IOException {
-        if (update.size <= 0 || update.size > MAX_APK) throw new IOException("Invalid APK size");
+        if (update.size <= 0 || update.size > MAX_APK) throw new UpdateFailure(MANIFEST, METADATA);
         File directory = new File(filesDirectory, "updates");
-        if (!directory.isDirectory() && !directory.mkdirs()) throw new IOException("Cannot create private update directory");
         File partial = new File(directory, APK + ".part");
         File target = new File(directory, APK);
         boolean complete = false;
+        UpdateFailure.Stage stage = APK_STORAGE;
         try {
-            try (Response response = open(assetUrl(update.tag, APK), true, cancellation)) {
+            if (!directory.isDirectory() && !directory.mkdirs()) throw new UpdateFailure(APK_STORAGE, STORAGE);
+            stage = APK_DOWNLOAD;
+            try (Response response = open(assetUrl(update.tag, APK), true, cancellation, APK_DOWNLOAD)) {
                 long length = response.body().contentLength();
-                if (length != -1 && length != update.size) throw new IOException("APK size mismatch");
+                if (length != -1 && length != update.size) throw UpdateFailure.size(APK_DOWNLOAD, update.size, length);
+                stage = APK_STORAGE;
                 try (FileOutputStream output = new FileOutputStream(partial)) {
                     MessageDigest digest = sha256();
                     byte[] buffer = new byte[32 * 1024];
                     long total = 0;
                     int count;
                     InputStream input = response.body().byteStream();
-                    while ((count = input.read(buffer)) != -1) {
+                    while (true) {
+                        stage = APK_DOWNLOAD;
+                        count = input.read(buffer);
+                        if (count == -1) break;
                         cancellation.check();
                         total += count;
-                        if (total > update.size || total > MAX_APK) throw new IOException("APK too large");
+                        if (total > update.size || total > MAX_APK) throw UpdateFailure.size(APK_DOWNLOAD, update.size, total);
                         digest.update(buffer, 0, count);
+                        stage = APK_STORAGE;
                         output.write(buffer, 0, count);
                     }
                     requireDigest(update, total, digest.digest());
+                    stage = APK_STORAGE;
                     output.getFD().sync();
                 }
+                stage = APK_DOWNLOAD;
             }
             cancellation.check();
-            if (!partial.renameTo(target)) throw new IOException("Cannot save verified download");
+            stage = APK_STORAGE;
+            if (!partial.renameTo(target)) throw new UpdateFailure(APK_STORAGE, STORAGE);
             complete = true;
             return target;
+        } catch (IOException | IllegalArgumentException | SecurityException error) {
+            throw UpdateFailure.at(stage, error);
         } finally {
             if (!complete && partial.exists() && !partial.delete()) partial.deleteOnExit();
         }
@@ -260,7 +288,7 @@ final class UpdateClient {
 
     static void verifyFile(File file, Update update, Cancellation cancellation) throws IOException {
         if (update.size <= 0 || update.size > MAX_APK || file.length() != update.size) {
-            throw new IOException("APK size mismatch");
+            throw UpdateFailure.size(FILE_VERIFY, update.size, file.length());
         }
         MessageDigest digest = sha256();
         long total = 0;
@@ -270,7 +298,7 @@ final class UpdateClient {
             while ((count = input.read(buffer)) != -1) {
                 cancellation.check();
                 total += count;
-                if (total > update.size) throw new IOException("APK size mismatch");
+                if (total > update.size) throw UpdateFailure.size(FILE_VERIFY, update.size, total);
                 digest.update(buffer, 0, count);
             }
         }
@@ -289,6 +317,7 @@ final class UpdateClient {
     private static void requireDigest(Update update, long size, byte[] bytes) throws IOException {
         StringBuilder hex = new StringBuilder();
         for (byte value : bytes) hex.append(String.format(java.util.Locale.ROOT, "%02x", value & 0xff));
-        if (size != update.size || !hex.toString().equals(update.sha256)) throw new IOException("APK integrity check failed");
+        if (size != update.size) throw UpdateFailure.size(FILE_VERIFY, update.size, size);
+        if (!hex.toString().equals(update.sha256)) throw new UpdateFailure(FILE_VERIFY, HASH);
     }
 }

@@ -3,6 +3,12 @@ package io.github.waksana.cockpitdashboard;
 import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.EOFException;
+import java.io.InterruptedIOException;
+import java.net.ConnectException;
+import java.net.ProtocolException;
+import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.security.MessageDigest;
@@ -17,6 +23,11 @@ import okhttp3.Protocol;
 import okhttp3.Request;
 import okhttp3.Response;
 import okhttp3.ResponseBody;
+import okio.BufferedSource;
+import okio.Okio;
+import okio.Source;
+import okio.Timeout;
+import javax.net.ssl.SSLHandshakeException;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.After;
@@ -226,5 +237,128 @@ public class UpdateClientTest {
             assertThrows(IOException.class, () -> client.download(update, files, new UpdateClient.Cancellation()));
             assertFalse(new File(files, "updates/" + UpdateClient.APK + ".part").exists());
         }
+    }
+
+    @Test public void transportDiagnosticsUseOnlyFixedReasonsNotExceptionTextOrCauses() {
+        String secret = "https://private.example/file?signature=secret Cookie: private chat audio";
+        Exception[] failures = {new UnknownHostException(secret), new SocketTimeoutException(secret),
+                new SSLHandshakeException(secret), new ConnectException(secret), new EOFException(secret),
+                new ProtocolException(secret), new InterruptedIOException(secret), new IOException(secret),
+                new SecurityException(secret), new IllegalArgumentException(secret)};
+        UpdateFailure.Reason[] reasons = {UpdateFailure.Reason.DNS, UpdateFailure.Reason.TIMEOUT,
+                UpdateFailure.Reason.TLS, UpdateFailure.Reason.CONNECT, UpdateFailure.Reason.TRUNCATED,
+                UpdateFailure.Reason.PROTOCOL, UpdateFailure.Reason.INTERRUPTED, UpdateFailure.Reason.IO,
+                UpdateFailure.Reason.PERMISSION, UpdateFailure.Reason.INVALID};
+        for (int i = 0; i < failures.length; i++) {
+            UpdateFailure failure = UpdateFailure.at(UpdateFailure.Stage.APK_DOWNLOAD, failures[i]);
+            assertEquals(reasons[i], failure.reason);
+            assertNull(failure.getCause());
+            assertFalse(failure.describe(23, 10203).contains(secret));
+            assertFalse(failure.getMessage().contains(secret));
+        }
+    }
+
+    @Test public void networkFailuresKeepReleaseManifestAndApkStages() throws Exception {
+        byte[] releaseBody = bytes(release());
+        UpdateClient failing = new UpdateClient(new OkHttpClient.Builder().addInterceptor(chain -> {
+            if (chain.request().url().toString().equals(UpdateClient.LATEST)) {
+                return new Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200)
+                        .message("fixture").body(ResponseBody.create(releaseBody, null)).build();
+            }
+            throw new SSLHandshakeException("private URL or certificate subject");
+        }).build());
+        UpdateFailure manifest = assertThrows(UpdateFailure.class,
+                () -> failing.check(1, new UpdateClient.Cancellation()));
+        assertEquals(UpdateFailure.Stage.MANIFEST, manifest.stage);
+        assertEquals(UpdateFailure.Reason.TLS, manifest.reason);
+        UpdateFailure apk = assertThrows(UpdateFailure.class, () -> failing.download(
+                UpdateClient.parseManifest(bytes(manifest()), TAG), RuntimeEnvironment.getApplication().getFilesDir(),
+                new UpdateClient.Cancellation()));
+        assertEquals(UpdateFailure.Stage.APK_DOWNLOAD, apk.stage);
+        assertEquals(UpdateFailure.Reason.TLS, apk.reason);
+        UpdateClient dns = new UpdateClient(new OkHttpClient.Builder().addInterceptor(chain -> {
+            throw new UnknownHostException("private host");
+        }).build());
+        UpdateFailure release = assertThrows(UpdateFailure.class,
+                () -> dns.check(1, new UpdateClient.Cancellation()));
+        assertEquals(UpdateFailure.Stage.RELEASE, release.stage);
+        assertEquals(UpdateFailure.Reason.DNS, release.reason);
+    }
+
+    @Test public void httpAndRedirectFailuresRetainSafeStageAndNumericStatus() throws Exception {
+        responses.add(new Response.Builder().code(403).message("secret").body(ResponseBody.create("secret", null)));
+        UpdateFailure release = assertThrows(UpdateFailure.class,
+                () -> client.check(1, new UpdateClient.Cancellation()));
+        assertEquals(UpdateFailure.Stage.RELEASE, release.stage);
+        assertEquals(UpdateFailure.Reason.HTTP, release.reason);
+        assertTrue(release.describe(23, null).contains("HTTP=403"));
+        assertFalse(release.describe(23, null).contains("secret"));
+        respond(bytes(release()));
+        redirect("https://evil.example/manifest?token=secret");
+        UpdateFailure redirect = assertThrows(UpdateFailure.class,
+                () -> client.check(1, new UpdateClient.Cancellation()));
+        assertEquals(UpdateFailure.Stage.MANIFEST, redirect.stage);
+        assertEquals(UpdateFailure.Reason.REDIRECT, redirect.reason);
+        UpdateClient.Update update = UpdateClient.parseManifest(bytes(manifest()), TAG);
+        responses.add(new Response.Builder().code(503).body(ResponseBody.create("secret", null)));
+        UpdateFailure download = assertThrows(UpdateFailure.class, () -> client.download(update,
+                RuntimeEnvironment.getApplication().getFilesDir(), new UpdateClient.Cancellation()));
+        assertEquals(UpdateFailure.Stage.APK_DOWNLOAD, download.stage);
+        assertTrue(download.describe(23, update.versionCode).contains("HTTP=503"));
+    }
+
+    @Test public void downloadDistinguishesNetworkReadStorageSizeAndDigestAndRemovesPartialFiles() throws Exception {
+        UpdateClient.Update update = UpdateClient.parseManifest(bytes(manifest()), TAG);
+        File files = RuntimeEnvironment.getApplication().getFilesDir();
+        respond(new byte[1]);
+        UpdateFailure size = assertThrows(UpdateFailure.class,
+                () -> client.download(update, files, new UpdateClient.Cancellation()));
+        assertEquals(UpdateFailure.Reason.SIZE, size.reason);
+        assertTrue(size.describe(23, update.versionCode).contains("actualBytes=1"));
+        respond(new byte[APK_BYTES.length]);
+        UpdateFailure hash = assertThrows(UpdateFailure.class,
+                () -> client.download(update, files, new UpdateClient.Cancellation()));
+        assertEquals(UpdateFailure.Stage.FILE_VERIFY, hash.stage);
+        assertEquals(UpdateFailure.Reason.HASH, hash.reason);
+        responses.add(new Response.Builder().code(200).body(new ResponseBody() {
+            @Override public MediaType contentType() { return null; }
+            @Override public long contentLength() { return -1; }
+            @Override public BufferedSource source() {
+                return Okio.buffer(new Source() {
+                    @Override public long read(okio.Buffer sink, long byteCount) throws IOException {
+                        throw new SocketTimeoutException("secret signed URL");
+                    }
+                    @Override public Timeout timeout() { return Timeout.NONE; }
+                    @Override public void close() {}
+                });
+            }
+        }));
+        UpdateFailure read = assertThrows(UpdateFailure.class,
+                () -> client.download(update, files, new UpdateClient.Cancellation()));
+        assertEquals(UpdateFailure.Stage.APK_DOWNLOAD, read.stage);
+        assertEquals(UpdateFailure.Reason.TIMEOUT, read.reason);
+        assertFalse(new File(files, "updates/" + UpdateClient.APK + ".part").exists());
+        File directory = new File(files, "updates");
+        assertTrue(directory.delete());
+        assertTrue(directory.createNewFile());
+        UpdateFailure storage = assertThrows(UpdateFailure.class,
+                () -> client.download(update, files, new UpdateClient.Cancellation()));
+        assertEquals(UpdateFailure.Stage.APK_STORAGE, storage.stage);
+        assertEquals(UpdateFailure.Reason.STORAGE, storage.reason);
+        assertTrue(directory.delete());
+    }
+
+    @Test public void malformedReleaseAndManifestAreNotMisreportedAsNetworkFailures() throws Exception {
+        respond(new byte[]{'{'});
+        UpdateFailure release = assertThrows(UpdateFailure.class,
+                () -> client.check(1, new UpdateClient.Cancellation()));
+        assertEquals(UpdateFailure.Stage.RELEASE, release.stage);
+        assertEquals(UpdateFailure.Reason.METADATA, release.reason);
+        respond(bytes(release()));
+        respond(bytes(manifest().put("sha256", "secret")));
+        UpdateFailure manifest = assertThrows(UpdateFailure.class,
+                () -> client.check(1, new UpdateClient.Cancellation()));
+        assertEquals(UpdateFailure.Stage.MANIFEST, manifest.stage);
+        assertEquals(UpdateFailure.Reason.METADATA, manifest.reason);
     }
 }

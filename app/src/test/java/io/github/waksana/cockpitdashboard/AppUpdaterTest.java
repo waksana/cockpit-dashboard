@@ -25,6 +25,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Protocol;
@@ -40,6 +42,7 @@ import org.robolectric.android.controller.ActivityController;
 import org.robolectric.annotation.Config;
 import org.robolectric.annotation.LooperMode;
 import org.robolectric.shadows.ShadowAlertDialog;
+import org.robolectric.shadows.ShadowLog;
 import static org.robolectric.Shadows.shadowOf;
 import static org.junit.Assert.*;
 
@@ -63,6 +66,7 @@ public class AppUpdaterTest {
     }
 
     @Before public void setup() throws Exception {
+        ShadowLog.clear();
         controller = Robolectric.buildActivity(TestActivity.class).setup();
         activity = controller.get();
         update = UpdateClient.parseManifest(UpdateClientTest.bytes(UpdateClientTest.manifest()), UpdateClientTest.TAG);
@@ -188,6 +192,11 @@ public class AppUpdaterTest {
         assertEquals(1, statuses.size());
         assertTrue(statuses.get(0).contains("检查失败"));
         assertFalse(statuses.get(0).contains("synthetic"));
+        assertTrue(statuses.get(0).contains("RELEASE/IO"));
+        assertTrue(statuses.get(0).contains("API=28"));
+        assertEquals(1, ShadowLog.getLogsForTag("DashboardUpdater").size());
+        assertNull(ShadowLog.getLogsForTag("DashboardUpdater").get(0).throwable);
+        assertFalse(ShadowLog.getLogsForTag("DashboardUpdater").get(0).msg.contains("synthetic"));
         updater.presentIfReady();
         assertEquals(1, statuses.size());
     }
@@ -237,6 +246,7 @@ public class AppUpdaterTest {
         assertEquals(notices, statuses.size());
         assertFalse(updater.isBusy());
         assertNull(ShadowAlertDialog.getLatestAlertDialog());
+        assertTrue(ShadowLog.getLogsForTag("DashboardUpdater").isEmpty());
     }
 
     private File stageVerified() throws Exception {
@@ -314,6 +324,7 @@ public class AppUpdaterTest {
         await(() -> !updater.isBusy());
         assertTrue(statuses.get(statuses.size() - 1).contains("无法打开 Android 安装器"));
         assertFalse(statuses.get(statuses.size() - 1).contains("synthetic"));
+        assertTrue(statuses.get(statuses.size() - 1).contains("INSTALLER/NOT_FOUND"));
         activity.reject = false;
         Files.write(apk.toPath(), new byte[UpdateClientTest.APK_BYTES.length]);
         updater.check(true);
@@ -321,6 +332,110 @@ public class AppUpdaterTest {
         await(() -> !updater.isBusy());
         assertNull(shadowOf(activity).getNextStartedActivity());
         assertTrue(statuses.get(statuses.size() - 1).contains("安全校验失败"));
+        assertTrue(statuses.get(statuses.size() - 1).contains("FILE_VERIFY/HASH"));
+    }
+
+    @Test public void packageChecksReportDistinctParseIdentityVersionCompatibilityAndCertificateFailures() throws Exception {
+        PackageInfo installed = packageInfo(activity.getPackageName(), 10000, 23, "01");
+        PackageInfo[] invalid = {null, packageInfo("other.package", 10203, 23, "01"),
+                packageInfo(activity.getPackageName(), 10204, 23, "01"),
+                packageInfo(activity.getPackageName(), 10203, 29, "01"),
+                packageInfo(activity.getPackageName(), 10203, 23, "02")};
+        UpdateFailure.Stage[] stages = {UpdateFailure.Stage.APK_PARSE, UpdateFailure.Stage.PACKAGE,
+                UpdateFailure.Stage.VERSION, UpdateFailure.Stage.MIN_SDK, UpdateFailure.Stage.SIGNATURE};
+        UpdateFailure.Reason[] reasons = {UpdateFailure.Reason.ARCHIVE, UpdateFailure.Reason.PACKAGE,
+                UpdateFailure.Reason.VERSION_CODE, UpdateFailure.Reason.MIN_SDK, UpdateFailure.Reason.CERTIFICATE};
+        for (int i = 0; i < invalid.length; i++) {
+            PackageInfo archive = invalid[i];
+            UpdateFailure failure = assertThrows(UpdateFailure.class, () -> AppUpdater.validatePackages(
+                    activity.getPackageName(), installed, archive, update, 28));
+            assertEquals(stages[i], failure.stage);
+            assertEquals(reasons[i], failure.reason);
+            if (i == 3) assertTrue(failure.describe(28, update.versionCode).contains("minSdk=29"));
+        }
+    }
+
+    @Test public void nullSigningHistoryEntryFailsClosedInsteadOfCrashingWorker() throws Exception {
+        PackageInfo installed = packageInfo(activity.getPackageName(), 10000, 23, "01");
+        PackageInfo archive = packageInfo(activity.getPackageName(), 10203, 23, "01");
+        shadowOf(archive.signingInfo).setPastSigningCertificates(new Signature[]{null});
+        UpdateFailure failure = assertThrows(UpdateFailure.class, () -> AppUpdater.validatePackages(
+                activity.getPackageName(), installed, archive, update, 28));
+        assertEquals(UpdateFailure.Reason.SIGNER_HISTORY, failure.reason);
+        assertEquals(UpdateFailure.Stage.APK_SIGNER, failure.stage);
+        shadowOf(installed.signingInfo).setPastSigningCertificates(new Signature[]{null});
+        failure = assertThrows(UpdateFailure.class, () -> AppUpdater.validatePackages(
+                activity.getPackageName(), installed, archive, update, 28));
+        assertEquals(UpdateFailure.Stage.INSTALLED_SIGNER, failure.stage);
+    }
+
+    @Test public void downloadFailureIsReadableWithoutAdbAndLogsNoServerBodyOrSignedUrl() throws Exception {
+        create(synthetic(chain -> new Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1)
+                .code(403).message("secret HTTP message")
+                .body(ResponseBody.create("https://private.example?signature=secret Cookie: private", null)).build()));
+        field("update", update);
+        updater.presentIfReady();
+        ShadowAlertDialog.getLatestAlertDialog().getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+        await(() -> !updater.isBusy());
+        String notice = statuses.get(statuses.size() - 1);
+        assertTrue(notice.contains("APK_DOWNLOAD/HTTP"));
+        assertTrue(notice.contains("HTTP=403"));
+        assertTrue(notice.contains("API=28"));
+        assertTrue(notice.contains("targetCode=10203"));
+        assertFalse(notice.contains("secret"));
+        assertFalse(notice.contains("https://"));
+        assertNull(shadowOf(activity).getNextStartedActivity());
+        assertEquals(1, ShadowLog.getLogsForTag("DashboardUpdater").size());
+        assertNull(ShadowLog.getLogsForTag("DashboardUpdater").get(0).throwable);
+        assertFalse(ShadowLog.getLogsForTag("DashboardUpdater").get(0).msg.contains("secret"));
+        updater.presentIfReady();
+        assertFalse(updater.isBusy());
+    }
+
+    @Test public void systemArchiveParseFailureIsNotBlamedOnSignatureAndDeletesFile() throws Exception {
+        File apk = stageVerified();
+        shadowOf(activity.getPackageManager()).setPackageArchiveInfo(apk.getAbsolutePath(), null);
+        updater.presentIfReady();
+        ShadowAlertDialog.getLatestAlertDialog().getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+        await(() -> !updater.isBusy());
+        assertTrue(statuses.get(statuses.size() - 1).contains("APK_PARSE/ARCHIVE"));
+        assertFalse(apk.exists());
+        assertNull(shadowOf(activity).getNextStartedActivity());
+    }
+
+    @Test @Config(sdk = 23) public void unreadableApi23ManifestHasCompatibilityDiagnostic() throws Exception {
+        File apk = stageVerified();
+        updater.presentIfReady();
+        ShadowAlertDialog.getLatestAlertDialog().getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+        await(() -> !updater.isBusy());
+        String notice = statuses.get(statuses.size() - 1);
+        assertTrue(notice, notice.contains("MIN_SDK/BINARY_MANIFEST"));
+        assertTrue(notice.contains("API=23"));
+        assertFalse(apk.exists());
+        assertNull(shadowOf(activity).getNextStartedActivity());
+    }
+
+    @Test @Config(sdk = 23) public void api23TooNewManifestShowsRequiredAndActualApiWithoutInstalling() throws Exception {
+        File apk = stageVerified();
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ZipOutputStream zip = new ZipOutputStream(bytes)) {
+            zip.putNextEntry(new ZipEntry("AndroidManifest.xml"));
+            zip.write(binaryManifest(24));
+            zip.closeEntry();
+        }
+        byte[] content = bytes.toByteArray();
+        Files.write(apk.toPath(), content);
+        field("update", new UpdateClient.Update(update.versionCode, update.versionName,
+                UpdateClientTest.digest(content), content.length, update.tag));
+        updater.presentIfReady();
+        ShadowAlertDialog.getLatestAlertDialog().getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+        await(() -> !updater.isBusy());
+        String notice = statuses.get(statuses.size() - 1);
+        assertTrue(notice, notice.contains("MIN_SDK/MIN_SDK"));
+        assertTrue(notice.contains("minSdk=24"));
+        assertTrue(notice.contains("API=23"));
+        assertFalse(apk.exists());
+        assertNull(shadowOf(activity).getNextStartedActivity());
     }
 
     @Test public void binaryManifestSupportsApi23MinSdkAndRejectsUnsupportedValues() throws Exception {

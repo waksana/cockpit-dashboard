@@ -3,6 +3,7 @@ package io.github.waksana.cockpitdashboard;
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 import okhttp3.OkHttpClient;
+import okhttp3.mockwebserver.Dispatcher;
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
 import okhttp3.mockwebserver.RecordedRequest;
@@ -92,14 +93,83 @@ public class HostClientTest {
     }
 
     @Test public void speechPathComesFromDiscoveryNotKnownDigest() throws Exception {
-        String path = "/_modules/cockpit-speech/" + "c".repeat(64) + "/api";
-        server.enqueue(new MockResponse().setBody("{\"modules\":[{\"id\":\"cockpit-speech\",\"apiBase\":\"" + path + "\"}]}"));
-        server.enqueue(new MockResponse().setBody("{\"clientSecret\":\"synthetic\"}"));
-        client.speechCredential();
-        assertEquals("/_modules", server.takeRequest().getPath());
+        String digest = "c".repeat(64);
+        String path = "/_modules/cockpit-speech/" + digest + "/api";
+        // Mirror the Host module router: a digest in the URL alone is insufficient.
+        server.setDispatcher(new Dispatcher() {
+            @Override public MockResponse dispatch(RecordedRequest request) {
+                if ("/_modules".equals(request.getPath())) {
+                    return new MockResponse().setBody(discovery(digest, path));
+                }
+                if (!(path + "/session").equals(request.getPath())) return new MockResponse().setBody("{}");
+                if (!digest.equals(request.getHeader("X-Cockpit-Module-Digest"))) {
+                    return new MockResponse().setResponseCode(409).setBody("{\"code\":\"MODULE_VERSION_MISMATCH\"}");
+                }
+                return new MockResponse().setBody("{\"clientSecret\":\"synthetic\"}");
+            }
+        });
+        assertEquals("synthetic", client.speechCredential().getString("clientSecret"));
+        RecordedRequest discovery = server.takeRequest();
+        assertEquals("/_modules", discovery.getPath());
+        assertNull(discovery.getHeader("X-Cockpit-Module-Digest"));
         RecordedRequest credential = server.takeRequest();
         assertEquals(path + "/session", credential.getPath());
+        assertEquals("POST", credential.getMethod());
+        assertEquals(digest, credential.getHeader("X-Cockpit-Module-Digest"));
+        assertEquals(discovery.getHeader("Authorization"), credential.getHeader("Authorization"));
         assertEquals("{}", credential.getBody().readUtf8());
+        client.request("/capabilities", null);
+        assertNull(server.takeRequest().getHeader("X-Cockpit-Module-Digest"));
+    }
+
+    private static String discovery(String digest, String path) {
+        return "{\"modules\":[{\"id\":\"cockpit-speech\",\"digest\":\"" + digest
+                + "\",\"apiBase\":\"" + path + "\"}]}";
+    }
+
+    @Test public void speechRejectsMissingInvalidOrMismatchedDigestBeforePost() throws Exception {
+        String path = "/_modules/cockpit-speech/" + "c".repeat(64) + "/api";
+        for (String digest : new String[]{"", "x".repeat(64), "C".repeat(64), "d".repeat(64)}) {
+            server.enqueue(new MockResponse().setBody(discovery(digest, path)));
+            assertThrows(IOException.class, () -> client.speechCredential());
+            assertEquals("/_modules", server.takeRequest().getPath());
+        }
+        server.enqueue(new MockResponse().setBody("{\"modules\":[{\"id\":\"cockpit-speech\",\"apiBase\":\"" + path + "\"}]}"));
+        assertThrows(IOException.class, () -> client.speechCredential());
+        assertEquals("/_modules", server.takeRequest().getPath());
+        assertEquals(5, server.getRequestCount());
+    }
+
+    @Test public void speechConflictDoesNotRetryOrClaimAuthenticationFailure() throws Exception {
+        String digest = "a".repeat(64);
+        String path = "/_modules/cockpit-speech/" + digest + "/api";
+        server.enqueue(new MockResponse().setBody(discovery(digest, path)));
+        server.enqueue(new MockResponse().setResponseCode(409).setBody("{\"code\":\"MODULE_VERSION_MISMATCH\"}"));
+        HostClient.Rejected error = assertThrows(HostClient.Rejected.class, () -> client.speechCredential());
+        assertFalse(error instanceof HostClient.AuthenticationRequired);
+        assertTrue(error.getMessage().contains("模块"));
+        assertFalse(error.getMessage().contains("鉴权"));
+        assertEquals(2, server.getRequestCount());
+        server.takeRequest();
+        server.takeRequest();
+        String next = "b".repeat(64);
+        server.enqueue(new MockResponse().setBody(discovery(next, "/_modules/cockpit-speech/" + next + "/api")));
+        server.enqueue(new MockResponse().setBody("{\"clientSecret\":\"synthetic-next\"}"));
+        assertEquals("synthetic-next", client.speechCredential().getString("clientSecret"));
+        server.takeRequest();
+        assertEquals(next, server.takeRequest().getHeader("X-Cockpit-Module-Digest"));
+    }
+
+    @Test public void speechRedirectAndAuthenticationFailuresRemainFailClosed() throws Exception {
+        String digest = "a".repeat(64);
+        String path = "/_modules/cockpit-speech/" + digest + "/api";
+        for (int status : new int[]{302, 401}) {
+            server.enqueue(new MockResponse().setBody(discovery(digest, path)));
+            server.enqueue(new MockResponse().setResponseCode(status).setHeader("Location", "https://example.invalid"));
+            IOException error = assertThrows(IOException.class, () -> client.speechCredential());
+            assertEquals(status == 401, error instanceof HostClient.AuthenticationRequired);
+        }
+        assertEquals(4, server.getRequestCount());
     }
 
     @Test public void unsafeConfigurationAndCrossOriginModuleAreRejected() throws Exception {
@@ -107,9 +177,15 @@ public class HostClientTest {
         assertThrows(IllegalArgumentException.class, () -> HostClient.validateSettings("https://u:p@example.invalid", "id", ""));
         assertThrows(IllegalArgumentException.class, () -> HostClient.validateSettings("https://example.invalid/a", "id", ""));
         assertThrows(IllegalArgumentException.class, () -> HostClient.validateSettings("https://example.invalid", "id", "Bearer x\nX: a"));
-        server.enqueue(new MockResponse().setBody("{\"modules\":[{\"id\":\"cockpit-speech\",\"apiBase\":\"https://example.invalid\"}]}"));
-        assertThrows(IOException.class, () -> client.speechCredential());
-        assertEquals(1, server.getRequestCount());
+        String digest = "a".repeat(64);
+        String base = "/_modules/cockpit-speech/" + digest + "/api";
+        for (String path : new String[]{"https://example.invalid" + base, "//example.invalid" + base,
+                base + "?redirect=1", base + "/../api", base + "#fragment", base.replace("cockpit-speech", "other")}) {
+            server.enqueue(new MockResponse().setBody(discovery(digest, path)));
+            assertThrows(IOException.class, () -> client.speechCredential());
+            assertEquals("/_modules", server.takeRequest().getPath());
+        }
+        assertEquals(6, server.getRequestCount());
     }
 
     @Test public void historyKeepsSourceFiltersCursorAndDoesNotLoad() throws Exception {

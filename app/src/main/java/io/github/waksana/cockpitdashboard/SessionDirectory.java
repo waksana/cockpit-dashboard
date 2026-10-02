@@ -35,11 +35,22 @@ final class SessionDirectory {
         entries = new ArrayList<>();
         Set<String> ids = new HashSet<>();
         for (int i = 0; i < sessions.length(); i++) {
-            Entry entry = new Entry(sessions.getJSONObject(i));
+            JSONObject item = sessions.getJSONObject(i);
+            Entry entry = new Entry(item);
             if (!ids.add(entry.id)) throw new JSONException("Duplicate session ID");
-            entries.add(entry);
+            if (hasAssistantRole(item)) entries.add(entry);
         }
         next = result.has("cursor") ? result.getString("cursor") : null;
         if (next != null && (next.isEmpty() || next.length() > 2048)) throw new JSONException("Invalid directory cursor");
+    }
+
+    private static boolean hasAssistantRole(JSONObject item) throws JSONException {
+        if (!item.has("roles")) return false;
+        JSONArray roles = item.getJSONArray("roles");
+        boolean found = false;
+        for (int i = 0; i < roles.length(); i++) {
+            if ("assistant".equals(roles.getJSONObject(i).getString("roleId"))) found = true;
+        }
+        return found;
     }
 }

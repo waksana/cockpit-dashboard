@@ -12,6 +12,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
+import android.util.Log;
 import androidx.core.content.FileProvider;
 import java.io.File;
 import java.io.IOException;
@@ -23,6 +24,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
+import static io.github.waksana.cockpitdashboard.UpdateFailure.Stage.*;
 
 /** Activity-owned updater. All public hooks and Listener calls run on the main thread. */
 public final class AppUpdater {
@@ -78,7 +80,7 @@ public final class AppUpdater {
                     presentIfReady();
                 });
             } catch (IOException | PackageManager.NameNotFoundException | IllegalArgumentException | SecurityException error) {
-                finish(operation, () -> status("应用更新检查失败，请检查网络或稍后手动重试。"));
+                finish(operation, () -> failure("应用更新检查失败。", RELEASE, error, null));
             }
         });
     }
@@ -183,6 +185,14 @@ public final class AppUpdater {
         }
     }
 
+    private void failure(String summary, UpdateFailure.Stage stage, Throwable error, UpdateClient.Update selected) {
+        String diagnostic = UpdateFailure.at(stage, error).describe(Build.VERSION.SDK_INT,
+                selected == null ? null : selected.versionCode);
+        // Do not pass a Throwable: its message, causes and stack may contain signed URLs or device paths.
+        Log.w("DashboardUpdater", diagnostic);
+        status(summary + "\n" + diagnostic + "\n请记录此诊断信息，可稍后手动重试；未自动安装。");
+    }
+
     private UpdateClient.Cancellation begin() {
         busy = true;
         cancellation = new UpdateClient.Cancellation();
@@ -219,7 +229,7 @@ public final class AppUpdater {
                 finish(operation, () -> {
                     verified = null;
                     deferred = true;
-                    status("更新下载或安全校验失败，未安装。请手动重试；若持续失败，请检查发布签名与系统兼容性。");
+                    failure("更新下载或安全校验失败，未安装。", APK_DOWNLOAD, error, selected);
                 });
             }
         });
@@ -245,7 +255,7 @@ public final class AppUpdater {
                     Uri.parse("package:" + activity.getPackageName())));
         } catch (ActivityNotFoundException | SecurityException error) {
             waitingPermission = false;
-            status("无法打开安装来源设置。请在系统设置中允许此应用安装未知应用，再手动重试。");
+            failure("无法打开安装来源设置。请在系统设置中允许此应用安装未知应用。", SOURCE_SETTINGS, error, update);
         }
     }
 
@@ -272,7 +282,7 @@ public final class AppUpdater {
                         status("已打开 Android 安装器，请按系统提示完成；尚未确认安装成功。");
                     } catch (ActivityNotFoundException | SecurityException | IllegalArgumentException error) {
                         deferred = true;
-                        status("无法打开 Android 安装器，请检查系统是否支持安装及来源权限后手动重试。");
+                        failure("无法打开 Android 安装器，请检查系统是否支持安装及来源权限。", INSTALLER, error, selected);
                     }
                 });
             } catch (IOException | PackageManager.NameNotFoundException | IllegalArgumentException | SecurityException error) {
@@ -280,7 +290,7 @@ public final class AppUpdater {
                 finish(operation, () -> {
                     verified = null;
                     update = null;
-                    status("安装前安全校验失败，未安装。请重新检查更新。");
+                    failure("安装前安全校验失败，未安装。请重新检查更新。", FILE_VERIFY, error, selected);
                 });
             }
         });
@@ -293,22 +303,34 @@ public final class AppUpdater {
     }
 
     @SuppressWarnings("deprecation")
-    private PackageInfo installedPackage() throws PackageManager.NameNotFoundException {
-        return activity.getPackageManager().getPackageInfo(activity.getPackageName(),
-                Build.VERSION.SDK_INT >= 28 ? PackageManager.GET_SIGNING_CERTIFICATES : PackageManager.GET_SIGNATURES);
+    private PackageInfo installedPackage() throws PackageManager.NameNotFoundException, IOException {
+        try {
+            return activity.getPackageManager().getPackageInfo(activity.getPackageName(),
+                    Build.VERSION.SDK_INT >= 28 ? PackageManager.GET_SIGNING_CERTIFICATES : PackageManager.GET_SIGNATURES);
+        } catch (PackageManager.NameNotFoundException | IllegalArgumentException | SecurityException error) {
+            throw UpdateFailure.at(INSTALLED_PACKAGE, error);
+        }
     }
 
     @SuppressWarnings("deprecation")
     private void validateArchive(File apk, UpdateClient.Update selected, UpdateClient.Cancellation operation)
             throws IOException, PackageManager.NameNotFoundException {
-        UpdateClient.verifyFile(apk, selected, operation);
-        PackageInfo archive = activity.getPackageManager().getPackageArchiveInfo(apk.getAbsolutePath(),
-                Build.VERSION.SDK_INT >= 28 ? PackageManager.GET_SIGNING_CERTIFICATES : PackageManager.GET_SIGNATURES);
-        validatePackages(activity.getPackageName(), installedPackage(), archive, selected, Build.VERSION.SDK_INT);
-        if (Build.VERSION.SDK_INT < 24 && minSdkFromApk(apk, operation) > Build.VERSION.SDK_INT) {
-            throw new IOException("APK requires a newer Android version");
+        UpdateFailure.Stage stage = FILE_VERIFY;
+        try {
+            UpdateClient.verifyFile(apk, selected, operation);
+            stage = APK_PARSE;
+            PackageInfo archive = activity.getPackageManager().getPackageArchiveInfo(apk.getAbsolutePath(),
+                    Build.VERSION.SDK_INT >= 28 ? PackageManager.GET_SIGNING_CERTIFICATES : PackageManager.GET_SIGNATURES);
+            validatePackages(activity.getPackageName(), installedPackage(), archive, selected, Build.VERSION.SDK_INT);
+            if (Build.VERSION.SDK_INT < 24) {
+                stage = MIN_SDK;
+                int minimum = minSdkFromApk(apk, operation);
+                if (minimum > Build.VERSION.SDK_INT) throw UpdateFailure.minSdk(minimum);
+            }
+            operation.check();
+        } catch (IOException | IllegalArgumentException | SecurityException error) {
+            throw UpdateFailure.at(stage, error);
         }
-        operation.check();
     }
 
     @SuppressWarnings("deprecation")
@@ -318,34 +340,53 @@ public final class AppUpdater {
 
     static void validatePackages(String ownPackage, PackageInfo installed, PackageInfo archive,
             UpdateClient.Update selected, int sdk) throws IOException {
-        if (installed == null || archive == null || !ownPackage.equals(installed.packageName)
-                || !ownPackage.equals(archive.packageName)
-                || versionCode(archive) != selected.versionCode || versionCode(archive) <= versionCode(installed)
-                || !selected.versionName.equals(archive.versionName) || archive.applicationInfo == null
-                || (Build.VERSION.SDK_INT >= 24 && archive.applicationInfo.minSdkVersion > sdk)) {
-            throw new IOException("APK identity, version or compatibility mismatch");
+        if (installed == null) throw new UpdateFailure(INSTALLED_PACKAGE, UpdateFailure.Reason.NOT_FOUND);
+        if (archive == null || archive.applicationInfo == null) {
+            throw new UpdateFailure(APK_PARSE, UpdateFailure.Reason.ARCHIVE);
         }
-        Signature current = singleSigner(installed);
-        Signature candidate = singleSigner(archive);
-        if (!current.equals(candidate)) throw new IOException("APK signing certificate mismatch");
+        if (!ownPackage.equals(installed.packageName) || !ownPackage.equals(archive.packageName)) {
+            throw new UpdateFailure(PACKAGE, UpdateFailure.Reason.PACKAGE);
+        }
+        if (versionCode(archive) != selected.versionCode) {
+            throw new UpdateFailure(VERSION, UpdateFailure.Reason.VERSION_CODE);
+        }
+        if (versionCode(archive) <= versionCode(installed)) {
+            throw new UpdateFailure(VERSION, UpdateFailure.Reason.NOT_NEWER);
+        }
+        if (!selected.versionName.equals(archive.versionName)) {
+            throw new UpdateFailure(VERSION, UpdateFailure.Reason.VERSION_NAME);
+        }
+        if (Build.VERSION.SDK_INT >= 24 && archive.applicationInfo.minSdkVersion > sdk) {
+            throw UpdateFailure.minSdk(archive.applicationInfo.minSdkVersion);
+        }
+        Signature current = singleSigner(installed, INSTALLED_SIGNER);
+        Signature candidate = singleSigner(archive, APK_SIGNER);
+        if (!current.equals(candidate)) throw new UpdateFailure(SIGNATURE, UpdateFailure.Reason.CERTIFICATE);
     }
 
     @SuppressWarnings("deprecation")
-    private static Signature singleSigner(PackageInfo info) throws IOException {
+    private static Signature singleSigner(PackageInfo info, UpdateFailure.Stage stage) throws IOException {
         Signature[] signatures;
         if (Build.VERSION.SDK_INT >= 28) {
-            if (info.signingInfo == null || info.signingInfo.hasMultipleSigners()) {
-                throw new IOException("Missing or unsupported APK signers");
+            if (info.signingInfo == null) {
+                throw new UpdateFailure(stage, UpdateFailure.Reason.SIGNER_MISSING);
+            }
+            if (info.signingInfo.hasMultipleSigners()) {
+                throw new UpdateFailure(stage, UpdateFailure.Reason.SIGNER_MULTIPLE);
             }
             signatures = info.signingInfo.getApkContentsSigners();
-            Signature[] history = info.signingInfo.getSigningCertificateHistory();
-            if (history == null || history.length != 1 || signatures == null
-                    || signatures.length != 1 || !history[0].equals(signatures[0])) {
-                throw new IOException("Signing certificate rotation is unsupported");
-            }
         } else signatures = info.signatures;
-        if (signatures == null || signatures.length != 1 || signatures[0] == null) {
-            throw new IOException("Missing or unsupported APK signers");
+        if (signatures == null || signatures.length == 0 || (signatures.length == 1 && signatures[0] == null)) {
+            throw new UpdateFailure(stage, UpdateFailure.Reason.SIGNER_MISSING);
+        }
+        if (signatures.length != 1) {
+            throw new UpdateFailure(stage, UpdateFailure.Reason.SIGNER_MULTIPLE);
+        }
+        if (Build.VERSION.SDK_INT >= 28) {
+            Signature[] history = info.signingInfo.getSigningCertificateHistory();
+            if (history == null || history.length != 1 || history[0] == null || !history[0].equals(signatures[0])) {
+                throw new UpdateFailure(stage, UpdateFailure.Reason.SIGNER_HISTORY);
+            }
         }
         return signatures[0];
     }
@@ -358,6 +399,10 @@ public final class AppUpdater {
             try (InputStream input = zip.getInputStream(entry)) {
                 return binaryMinSdk(UpdateClient.boundedRead(input, UpdateClient.MAX_API, operation));
             }
+        } catch (java.io.InterruptedIOException error) {
+            throw UpdateFailure.at(MIN_SDK, error);
+        } catch (IOException error) {
+            throw new UpdateFailure(MIN_SDK, UpdateFailure.Reason.BINARY_MANIFEST);
         }
     }
 
