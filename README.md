@@ -18,6 +18,7 @@ answer mode is involved.
 | Right | Send an available draft once to its original destination. |
 | Up / down | Select options in the current question at the bottom of chat, or scroll chat. Moving above the first option returns to chat scrolling; at the top, another up press loads older history. |
 | Short confirm on a selected option | Preview the exact option as a draft, without sending. Hold instead to record. |
+| Short confirm in message content, without a draft | Enter link/table reading. Up/down selects controls, short confirm opens the selected link, left/right scrolls its table, and Back leaves reading. Holding confirm still records instead of activating a link. |
 | Back / menu | Return, reconnect, choose a session, advanced settings or exit. |
 
 The same input answers the session's current native `ask` when one was present

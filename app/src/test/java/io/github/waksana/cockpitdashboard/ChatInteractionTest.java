@@ -6,6 +6,8 @@ import android.view.ViewConfiguration;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.TextView;
+import android.widget.HorizontalScrollView;
+import android.content.Intent;
 import java.time.Duration;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -128,6 +130,81 @@ public class ChatInteractionTest {
             assertEquals(RemoteState.Phase.DRAFT, state.phase);
             assertEquals(-1, field(activity, "previewKey"));
             assertNull(field(activity, "client"));
+        }
+    }
+
+    private void layout(MainActivity activity) {
+        View decor = activity.getWindow().getDecorView();
+        decor.measure(View.MeasureSpec.makeMeasureSpec(480, View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(360, View.MeasureSpec.EXACTLY));
+        decor.layout(0, 0, 480, 360);
+    }
+
+    private void shortConfirm(MainActivity activity) {
+        key(activity, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_CENTER);
+        key(activity, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_DPAD_CENTER);
+    }
+
+    @Test public void remoteReadingOpensSelectedLinkAndScrollsTableWithoutRecordingOrSending() throws Exception {
+        try (ActivityController<MainActivity> controller = Robolectric.buildActivity(MainActivity.class).create()) {
+            MainActivity activity = controller.get();
+            set(activity, "foreground", true);
+            ViewGroup conversation = (ViewGroup) field(activity, "conversation");
+            conversation.removeAllViews();
+            ViewGroup body = (ViewGroup) new ChatMarkdown(activity).render(
+                    "[First](https://example.com/first) [Second](https://example.com/second)\n\n"
+                    + "| One | Two | Three | Four |\n| --- | --- | --- | --- |\n| A | B | C | D |");
+            conversation.addView(body);
+            layout(activity);
+            MarkdownNavigation navigation = (MarkdownNavigation) field(activity, "markdownNavigation");
+            shortConfirm(activity);
+            assertTrue(navigation.active());
+            assertNull(shadowOf(activity).getNextStartedActivity());
+            key(activity, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_DOWN);
+            shortConfirm(activity);
+            Intent opened = shadowOf(activity).getNextStartedActivity();
+            assertNotNull(opened);
+            assertEquals("https://example.com/second", opened.getDataString());
+            assertNull(shadowOf(activity).getNextStartedActivity());
+            key(activity, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_DOWN);
+            HorizontalScrollView table = (HorizontalScrollView) body.getChildAt(1);
+            key(activity, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_RIGHT);
+            assertTrue(table.getScrollX() > 0);
+            key(activity, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_DPAD_RIGHT);
+            key(activity, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_LEFT);
+            assertEquals(0, table.getScrollX());
+            key(activity, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_BACK);
+            key(activity, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_BACK);
+            assertFalse(navigation.active());
+            assertFalse((Boolean) field(activity, "dialog"));
+            assertEquals(RemoteState.Phase.IDLE, ((RemoteState) field(activity, "state")).phase);
+        }
+    }
+
+    @Test public void holdingSelectedLinkRecordsInsteadOfOpeningAndRebuildInvalidatesSelection() throws Exception {
+        try (ActivityController<MainActivity> controller = Robolectric.buildActivity(MainActivity.class).create()) {
+            MainActivity activity = controller.get();
+            set(activity, "foreground", true);
+            ViewGroup conversation = (ViewGroup) field(activity, "conversation");
+            conversation.removeAllViews();
+            conversation.addView(new ChatMarkdown(activity).render("[Link](https://example.com)"));
+            layout(activity);
+            shortConfirm(activity);
+            MarkdownNavigation navigation = (MarkdownNavigation) field(activity, "markdownNavigation");
+            assertTrue(navigation.active());
+            key(activity, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_CENTER);
+            activity.dispatchKeyEvent(new KeyEvent(0, 0, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_CENTER, 2));
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(ViewConfiguration.getLongPressTimeout()));
+            key(activity, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_DPAD_CENTER);
+            assertFalse(navigation.active());
+            assertNull(shadowOf(activity).getNextStartedActivity());
+            assertEquals(RemoteState.Phase.IDLE, ((RemoteState) field(activity, "state")).phase);
+            shortConfirm(activity);
+            assertTrue(navigation.active());
+            Method renderMessages = MainActivity.class.getDeclaredMethod("renderMessages", boolean.class);
+            renderMessages.setAccessible(true);
+            renderMessages.invoke(activity, false);
+            assertFalse(navigation.active());
         }
     }
 

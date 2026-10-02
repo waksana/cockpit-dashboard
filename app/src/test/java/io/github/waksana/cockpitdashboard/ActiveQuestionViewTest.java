@@ -155,10 +155,11 @@ public class ActiveQuestionViewTest {
         assertEquals(1, previews.size());
         View replaced = view.getChildAt(1);
         view.update(ask("two", "replacement"));
+        assertSame(replaced, view.getChildAt(1));
         replaced.performClick();
-        assertEquals(1, previews.size());
-        view.getChildAt(1).performClick();
         assertEquals(2, previews.size());
+        view.getChildAt(1).performClick();
+        assertEquals(3, previews.size());
         assertEquals("two", ids.get(1));
         assertEquals("replacement", previews.get(1));
     }

@@ -25,6 +25,7 @@ public final class ActiveQuestionView extends LinearLayout {
     private final List<String> choices = new ArrayList<>();
     private final List<TextView> rows = new ArrayList<>();
     private String requestId = "";
+    private String questionText = "";
     private boolean allowFreeform;
     private int selected = -1;
     private long generation;
@@ -41,7 +42,6 @@ public final class ActiveQuestionView extends LinearLayout {
     }
 
     public void update(JSONObject ask) {
-        final long version = ++generation;
         Object rawId = ask == null ? null : ask.opt("requestId");
         final String id = rawId instanceof String ? (String) rawId : "";
         List<String> next = new ArrayList<>();
@@ -52,11 +52,17 @@ public final class ActiveQuestionView extends LinearLayout {
                 if (choice instanceof String) next.add((String) choice);
             }
         }
+        String question = ask == null ? "" : ask.optString("question", "");
+        boolean freeform = ask != null && ask.optBoolean("allowFreeform", false);
+        if (id.equals(requestId) && next.equals(choices) && question.equals(questionText)
+                && freeform == allowFreeform) return;
+        final long version = ++generation;
         if (!id.equals(requestId) || !next.equals(choices)) selected = -1;
         requestId = id;
+        questionText = question;
         choices.clear();
         choices.addAll(next);
-        allowFreeform = ask != null && ask.optBoolean("allowFreeform", false);
+        allowFreeform = freeform;
         rows.clear();
         removeAllViews();
         if (id.isEmpty()) {
@@ -67,9 +73,9 @@ public final class ActiveQuestionView extends LinearLayout {
             return;
         }
         setVisibility(VISIBLE);
-        View question = markdown.render(ask.optString("question", ""), HIGHLIGHT);
-        question.setPadding(dp(12), dp(10), dp(12), dp(10));
-        addView(question);
+        View body = markdown.render(questionText, HIGHLIGHT);
+        body.setPadding(dp(12), dp(10), dp(12), dp(10));
+        addView(body);
         for (int i = 0; i < choices.size(); i++) {
             final int index = i;
             final String choice = choices.get(i);

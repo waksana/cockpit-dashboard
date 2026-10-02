@@ -38,6 +38,7 @@ public final class MainActivity extends Activity {
     private final ExecutorService writes = Executors.newSingleThreadExecutor();
     private final RemoteState state = new RemoteState();
     private final ChatProjection projection = new ChatProjection();
+    private final MarkdownNavigation markdownNavigation = new MarkdownNavigation();
     private PrivateStore store;
     private JSONObject settings = new JSONObject();
     private JSONObject meta;
@@ -195,6 +196,7 @@ public final class MainActivity extends Activity {
     @Override protected void onPause() {
         foreground = false;
         cancelPendingConfirm();
+        markdownNavigation.clear();
         cancelDirectory();
         if (updater != null) updater.pause();
         if (navigation != null) navigation.dismiss();
@@ -227,7 +229,7 @@ public final class MainActivity extends Activity {
 
     @Override public void onWindowFocusChanged(boolean focus) {
         super.onWindowFocusChanged(focus);
-        if (!focus) { cancelPendingConfirm(); interruptRecording(); }
+        if (!focus) { cancelPendingConfirm(); markdownNavigation.clear(); interruptRecording(); }
         else fullscreen();
     }
 
@@ -383,6 +385,8 @@ public final class MainActivity extends Activity {
     }
 
     private void renderMessages(boolean bottom) {
+        markdownNavigation.clear();
+        cancelPendingConfirm();
         conversation.removeAllViews();
         for (ChatProjection.Message message : projection.items()) {
             if (message.text.isEmpty()) continue;
@@ -498,6 +502,13 @@ public final class MainActivity extends Activity {
         }
         if (dialog) return super.dispatchKeyEvent(event);
         int key = event.getKeyCode();
+        if (key == KeyEvent.KEYCODE_BACK && markdownNavigation.active()) {
+            if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                markdownNavigation.clear();
+                cancelPendingConfirm();
+            }
+            return true;
+        }
         if (key == KeyEvent.KEYCODE_BACK || key == KeyEvent.KEYCODE_MENU) {
             if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) showMenu();
             return true;
@@ -505,6 +516,7 @@ public final class MainActivity extends Activity {
         if (key == KeyEvent.KEYCODE_DPAD_UP || key == KeyEvent.KEYCODE_DPAD_DOWN) {
             if (event.getAction() == KeyEvent.ACTION_DOWN) {
                 if (previewKey != -1) return true;
+                if (markdownNavigation.move(key == KeyEvent.KEYCODE_DPAD_UP ? -1 : 1)) return true;
                 if (state.phase == RemoteState.Phase.IDLE || state.phase == RemoteState.Phase.DRAFT) {
                     boolean selected = activeQuestion.selectedChoice() != null;
                     if (selected || atBottom()) {
@@ -520,6 +532,11 @@ public final class MainActivity extends Activity {
             return true;
         }
         if (key == 23 || key == 66 || key == 160 || key == 21 || key == 22) {
+            if ((key == 21 || key == 22) && state.phase == RemoteState.Phase.IDLE
+                    && markdownNavigation.active()) {
+                if (event.getAction() == KeyEvent.ACTION_UP) return true;
+                if (markdownNavigation.horizontal(key == 21 ? -1 : 1)) return true;
+            }
             if (key == 21) cancelPendingConfirm();
             if (key == 22 && previewKey != -1) return true;
             if (handleChoiceConfirm(event)) return true;
@@ -556,16 +573,19 @@ public final class MainActivity extends Activity {
             if (event.getAction() == KeyEvent.ACTION_UP) {
                 String request = previewRequest, answer = previewAnswer;
                 cancelPendingConfirm();
-                if (!event.isCanceled()) previewChoice(request, answer);
+                if (!event.isCanceled() && foreground && !dialog && !storageFailed) {
+                    if (!request.isEmpty()) previewChoice(request, answer);
+                    else if (state.phase == RemoteState.Phase.IDLE) markdownNavigation.confirm(conversation);
+                }
             }
             return true;
         }
         if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0
-                && activeQuestion.selectedChoice() != null
                 && (state.phase == RemoteState.Phase.IDLE || state.phase == RemoteState.Phase.DRAFT)) {
             previewKey = key;
-            previewRequest = activeQuestion.requestId();
-            previewAnswer = activeQuestion.selectedChoice();
+            boolean choice = !markdownNavigation.active() && activeQuestion.selectedChoice() != null;
+            previewRequest = choice ? activeQuestion.requestId() : "";
+            previewAnswer = choice ? activeQuestion.selectedChoice() : "";
             main.postDelayed(recordAfterHold, ViewConfiguration.getLongPressTimeout());
             return true;
         }
@@ -574,8 +594,9 @@ public final class MainActivity extends Activity {
 
     private final Runnable recordAfterHold = () -> {
         int key = previewKey;
-        boolean current = previewRequest.equals(activeQuestion.requestId());
+        boolean current = previewRequest.isEmpty() || previewRequest.equals(activeQuestion.requestId());
         cancelPendingConfirm();
+        markdownNavigation.clear();
         if (key != -1 && current && foreground && !dialog && !storageFailed
                 && state.down(key, 0) == RemoteState.Action.START) {
             startRecording();
@@ -844,6 +865,7 @@ public final class MainActivity extends Activity {
                 + "有草稿时再次录音：追加一段；失败、空结果或取消本段保留原稿。\n"
                 + "左键：取消本段录音或当前草稿；右键：发送草稿一次。\n"
                 + "上下键：滚动聊天或选择当前问题选项；短按确定：预览选项答案。\n"
+                + "正文中短按确定：进入链接/表格阅读；上下选择，短按确定打开链接，左右滚动表格，返回退出阅读。\n"
                 + "点击草稿可编辑；历史问题不能再次提交。\n\n应用更新诊断（最近 16 条）\n");
         JSONArray logs = settings.optJSONArray("updateDiagnostics");
         if (logs == null || logs.length() == 0) contents.append("暂无诊断");
@@ -862,6 +884,7 @@ public final class MainActivity extends Activity {
 
     private void showNavigation(AlertDialog box, Runnable[] after, Runnable cleanup) {
         cancelPendingConfirm();
+        markdownNavigation.clear();
         navigation = box;
         dialog = true;
         box.setOnDismissListener(d -> {
@@ -1029,6 +1052,7 @@ public final class MainActivity extends Activity {
 
     private void disconnect() {
         cancelPendingConfirm();
+        markdownNavigation.clear();
         cancelDirectory();
         connectionEpoch++;
         connected = false;
