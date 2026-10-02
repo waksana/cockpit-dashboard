@@ -45,7 +45,7 @@ public class HostClientTest {
 
     @Test public void exactNativeAskUsesRequestIdAndFreeformFlag() throws Exception {
         server.enqueue(new MockResponse().setBody("{\"meta\":{\"sessionId\":\"single-session\","
-                + "\"ask\":{\"requestId\":\"ask-1\",\"choices\":[\"Yes\"],\"allowFreeform\":false}}}"));
+                + "\"ask\":{\"requestId\":\"ask-1\",\"question\":\"Choose?\",\"choices\":[\"Yes\"],\"allowFreeform\":false}}}"));
         server.enqueue(new MockResponse().setBody("{\"ok\":true}"));
         client.send("Yes", new JSONObject().put("requestId", "ask-1"));
         server.takeRequest();
@@ -57,11 +57,32 @@ public class HostClientTest {
     }
 
     @Test public void staleAskAndInexactChoiceNeverFallBackToPrompt() throws Exception {
-        for (String ask : new String[]{"null", "{\"requestId\":\"ask-1\",\"choices\":[\"Yes\"],\"allowFreeform\":false}"}) {
+        for (String ask : new String[]{"null", "{\"requestId\":\"ask-1\",\"question\":\"Choose?\",\"choices\":[\"Yes\"],\"allowFreeform\":false}"}) {
             server.enqueue(new MockResponse().setBody("{\"meta\":{\"sessionId\":\"single-session\",\"ask\":" + ask + "}}"));
             assertThrows(HostClient.Rejected.class, () -> client.send("yes", new JSONObject().put("requestId", "ask-1")));
         }
+
         assertEquals(2, server.getRequestCount());
+    }
+
+    @Test public void authoritativeDecisionsCannotReviveStaleAskAtSendTime() throws Exception {
+        JSONObject ask = new JSONObject().put("requestId", "current").put("question", "Choose?")
+                .put("choices", new org.json.JSONArray().put("Yes")).put("allowFreeform", false);
+        JSONObject meta = new JSONObject().put("sessionId", "single-session").put("ask", ask)
+                .put("decisions", new org.json.JSONArray());
+        server.enqueue(new MockResponse().setBody(new JSONObject().put("meta", meta).toString()));
+        assertThrows(HostClient.Rejected.class, () -> client.send("Yes", ask));
+        assertEquals("/intent/session/get", server.takeRequest().getPath());
+        assertEquals(1, server.getRequestCount());
+        meta.put("ask", JSONObject.NULL).put("decisions", new org.json.JSONArray()
+                .put(new JSONObject().put("kind", "ask").put("request", ask)));
+        server.enqueue(new MockResponse().setBody(new JSONObject().put("meta", meta).toString()));
+        server.enqueue(new MockResponse().setBody("{\"ok\":true}"));
+        client.send("Yes", ask);
+        server.takeRequest();
+        RecordedRequest sent = server.takeRequest();
+        assertEquals("/intent/respondAsk", sent.getPath());
+        assertEquals("current", new JSONObject(sent.getBody().readUtf8()).getString("requestId"));
     }
 
     @Test public void disconnectAfterWriteIsUnknownAndNeverRetried() throws Exception {
@@ -197,6 +218,8 @@ public class HostClientTest {
         JSONObject body = new JSONObject(request.getBody().readUtf8());
         assertEquals("opaque", body.getString("cursor"));
         assertTrue(body.getBoolean("includeEphemeral"));
+        assertTrue(body.getJSONArray("types").toString().contains("tool.execution_start"));
+        assertTrue(body.getJSONArray("types").toString().contains("tool.execution_complete"));
         assertEquals("primary", body.getString("agentScope"));
     }
 }

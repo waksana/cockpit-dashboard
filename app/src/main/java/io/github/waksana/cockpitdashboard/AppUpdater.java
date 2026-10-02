@@ -33,6 +33,7 @@ public final class AppUpdater {
         boolean isReady();
         /** Non-blocking, credential-free status; must not open a dialog. */
         void status(String message);
+        default void failure(String message) { status(message); }
     }
 
     private final Activity activity;
@@ -46,6 +47,7 @@ public final class AppUpdater {
     private File verified;
     private AlertDialog dialog;
     private String pendingStatus;
+    private boolean pendingFailure;
 
     public AppUpdater(Activity activity, Listener listener) {
         this(activity, listener, new UpdateClient());
@@ -106,7 +108,10 @@ public final class AppUpdater {
         if (cancellation != null) {
             cancellation.cancel();
             cancellation = null;
-            if (busy) pendingStatus = "更新操作已中断；请手动检查更新后继续。";
+            if (busy) {
+                pendingStatus = "更新操作已中断；请手动检查更新后继续。";
+                pendingFailure = false;
+            }
         }
         busy = false;
         // A cancelled download must not immediately nag again when the activity resumes.
@@ -138,7 +143,8 @@ public final class AppUpdater {
         if (pendingStatus != null) {
             String message = pendingStatus;
             pendingStatus = null;
-            listener.status(message);
+            if (pendingFailure) listener.failure(message);
+            else listener.status(message);
         }
         if (!ready() || busy || dialog != null || update == null || deferred || waitingPermission) return;
         AlertDialog.Builder builder = new AlertDialog.Builder(activity);
@@ -178,10 +184,16 @@ public final class AppUpdater {
     }
 
     private void status(String message) {
+        status(message, false);
+    }
+
+    private void status(String message, boolean failure) {
         pendingStatus = message;
+        pendingFailure = failure;
         if (ready()) {
             pendingStatus = null;
-            listener.status(message);
+            if (failure) listener.failure(message);
+            else listener.status(message);
         }
     }
 
@@ -190,7 +202,7 @@ public final class AppUpdater {
                 selected == null ? null : selected.versionCode);
         // Do not pass a Throwable: its message, causes and stack may contain signed URLs or device paths.
         Log.w("DashboardUpdater", diagnostic);
-        status(summary + "\n" + diagnostic + "\n请记录此诊断信息，可稍后手动重试；未自动安装。");
+        status(summary + "\n" + diagnostic + "\n请记录此诊断信息，可稍后手动重试；未自动安装。", true);
     }
 
     private UpdateClient.Cancellation begin() {

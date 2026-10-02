@@ -13,8 +13,10 @@ import android.text.InputType;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.WindowManager;
 import android.widget.EditText;
+import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -29,8 +31,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
-import io.noties.markwon.Markwon;
-import io.noties.markwon.linkify.LinkifyPlugin;
 
 public final class MainActivity extends Activity {
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -57,7 +57,12 @@ public final class MainActivity extends Activity {
     private ScrollView scroll;
     private LinearLayout conversation;
     private TextView heading, status, draftView, questionView;
-    private Markwon markdown;
+    private LinearLayout draftActions;
+    private Button cancelDraftButton, sendDraftButton;
+    private ActiveQuestionView activeQuestion;
+    private int previewKey = -1;
+    private String previewRequest = "", previewAnswer = "";
+    private ChatMarkdown markdown;
     private boolean foreground, dialog, connected, busyRead, live, hasOlder, storageFailed;
     private boolean capturing;
     private boolean loginFailurePendingResume;
@@ -99,7 +104,13 @@ public final class MainActivity extends Activity {
                         && state.phase == RemoteState.Phase.IDLE;
             }
             @Override public void status(String message) {
-                updateNotice = message;
+                recordUpdateDiagnostic(message);
+                updateNotice = "";
+                renderState();
+            }
+            @Override public void failure(String message) {
+                recordUpdateDiagnostic(message);
+                updateNotice = "应用更新失败，详情见设置「操作说明与诊断」";
                 renderState();
             }
         });
@@ -114,12 +125,13 @@ public final class MainActivity extends Activity {
     }
 
     private void createViews() {
-        markdown = Markwon.builder(this).usePlugin(LinkifyPlugin.create()).build();
+        markdown = new ChatMarkdown(this);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(28, 16, 28, 16);
         root.setBackgroundColor(Color.rgb(15, 20, 29));
         root.setFocusableInTouchMode(true);
+        root.setDescendantFocusability(LinearLayout.FOCUS_BEFORE_DESCENDANTS);
         heading = text(18, Color.LTGRAY);
         root.addView(heading);
         scroll = new ScrollView(this);
@@ -129,7 +141,24 @@ public final class MainActivity extends Activity {
         scroll.addView(conversation);
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
         questionView = text(24, Color.rgb(254, 214, 123));
+        activeQuestion = new ActiveQuestionView(this, this::previewChoice);
         draftView = text(26, Color.WHITE);
+        draftView.setOnClickListener(v -> editDraft());
+        draftActions = new LinearLayout(this);
+        cancelDraftButton = new Button(this);
+        cancelDraftButton.setText("取消");
+        cancelDraftButton.setOnClickListener(v -> {
+            if (state.down(KeyEvent.KEYCODE_DPAD_LEFT, 0) == RemoteState.Action.DISCARD) discard();
+            renderState();
+        });
+        sendDraftButton = new Button(this);
+        sendDraftButton.setText("发送");
+        sendDraftButton.setOnClickListener(v -> {
+            if (state.down(KeyEvent.KEYCODE_DPAD_RIGHT, 0) == RemoteState.Action.SEND) send();
+            renderState();
+        });
+        draftActions.addView(cancelDraftButton, new LinearLayout.LayoutParams(0, -2, 1));
+        draftActions.addView(sendDraftButton, new LinearLayout.LayoutParams(0, -2, 1));
         status = text(18, Color.LTGRAY);
         root.addView(status);
         setContentView(root);
@@ -165,6 +194,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onPause() {
         foreground = false;
+        cancelPendingConfirm();
         cancelDirectory();
         if (updater != null) updater.pause();
         if (navigation != null) navigation.dismiss();
@@ -179,6 +209,7 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        cancelPendingConfirm();
         cancelDirectory();
         recordingEpoch++;
         connectionEpoch++;
@@ -196,7 +227,7 @@ public final class MainActivity extends Activity {
 
     @Override public void onWindowFocusChanged(boolean focus) {
         super.onWindowFocusChanged(focus);
-        if (!focus) interruptRecording();
+        if (!focus) { cancelPendingConfirm(); interruptRecording(); }
         else fullscreen();
     }
 
@@ -356,23 +387,44 @@ public final class MainActivity extends Activity {
         for (ChatProjection.Message message : projection.items()) {
             if (message.text.isEmpty()) continue;
             TextView label = text(16, message.speaker.equals("你") ? Color.rgb(136, 191, 255) : Color.LTGRAY);
-            label.setText(message.speaker + (message.complete ? "" : " · 回复中"));
+            label.setText(message.askStatus != null ? "历史问题 · " + askStatus(message.askStatus)
+                    : message.askReply ? "你 · 问题回复" : message.speaker + (message.complete ? "" : " · 回复中"));
             conversation.addView(label);
-            TextView body = text(25, Color.WHITE);
-            markdown.setMarkdown(body, message.text);
-            // Navigation remains on the remote's chat surface; URLs stay readable.
-            body.setFocusable(false);
-            conversation.addView(body);
+            if (message.askReply && (message.question == null || message.question.isEmpty())) {
+                TextView unavailable = text(18, Color.LTGRAY);
+                unavailable.setText("原问题记录不可用");
+                conversation.addView(unavailable);
+            }
+            conversation.addView(markdown.render(message.text));
+            for (int i = 0; i < message.choices.size(); i++) {
+                TextView choice = text(23, Color.LTGRAY);
+                choice.setText((i + 1) + ". " + message.choices.get(i));
+                conversation.addView(choice);
+            }
         }
         if (conversation.getChildCount() == 0) {
             TextView empty = text(26, Color.LTGRAY);
             empty.setGravity(Gravity.CENTER);
-            empty.setText("按住确定键说话\n松开预览 · 左键发送 · 右键取消");
+            empty.setText("暂无聊天内容");
             conversation.addView(empty);
         }
         conversation.addView(questionView);
+        conversation.addView(activeQuestion);
         conversation.addView(draftView);
+        conversation.addView(draftActions);
         if (bottom) scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
+    }
+
+    private static String askStatus(ChatProjection.AskStatus status) {
+        switch (status) {
+            case ANSWERED: return "已回答";
+            case FAILED: return "失败，未记录有效答案";
+            case CANCELLED: return "已取消";
+            case DISMISSED: return "已关闭";
+            case EXPIRED: return "已过期";
+            case UNKNOWN: return "结果未知";
+            default: return "未记录结果，仅供查看";
+        }
     }
 
     private void renderState() {
@@ -380,41 +432,50 @@ public final class MainActivity extends Activity {
         heading.setText((meta == null ? "Cockpit Dashboard" : meta.optString("title", "Copilot"))
                 + "    " + (connected ? "已连接" : "未连接"));
         String question = "";
-        if (meta != null) {
-            JSONObject ask = meta.optJSONObject("ask");
-            if (ask != null) {
-                question = ask.optString("question");
-                JSONArray choices = ask.optJSONArray("choices");
-                if (choices != null && choices.length() > 0) {
-                    StringBuilder words = new StringBuilder();
-                    for (int i = 0; i < choices.length(); i++) {
-                        if (i > 0) words.append(" / ");
-                        words.append(choices.optString(i));
-                    }
-                    question += "\n" + words;
-                }
-            } else if (meta.optJSONObject("planRequest") != null || meta.optJSONObject("elicitation") != null) {
-                question = "当前会话需要在 Cockpit 处理计划或授权请求；本 App 不会自动批准。";
-            }
+        if (PendingDecision.requiresCockpit(meta)) {
+            question = "当前会话的待决请求需在 Cockpit 处理；本 App 不会猜测或自动批准。";
         }
+        activeQuestion.update(connected ? PendingDecision.ask(meta) : null);
         questionView.setText(question);
         questionView.setVisibility(question.isEmpty() ? View.GONE : View.VISIBLE);
-        draftView.setText(state.draft.isEmpty() ? "" : "未发送草稿\n" + state.draft);
+        draftView.setText(state.draft.isEmpty() ? "" : "未发送草稿（点击编辑）\n" + state.draft);
         draftView.setVisibility(state.draft.isEmpty() ? View.GONE : View.VISIBLE);
+        draftActions.setVisibility(state.phase == RemoteState.Phase.IDLE ? View.GONE : View.VISIBLE);
+        cancelDraftButton.setEnabled(state.phase != RemoteState.Phase.SENDING);
+        cancelDraftButton.setText(state.phase == RemoteState.Phase.RECORDING
+                || state.phase == RemoteState.Phase.TRANSCRIBING ? "取消本段" : "取消草稿");
+        sendDraftButton.setEnabled(state.phase == RemoteState.Phase.DRAFT && connected && !storageFailed);
         String hint;
         switch (state.phase) {
-            case RECORDING: hint = capturing ? "● 正在采音，松开结束 · 右键取消" : "准备录音，请等待 USB 采音提示"; break;
-            case TRANSCRIBING: hint = "正在转写，尚未发送 · 右键取消"; break;
-            case DRAFT: hint = "未发送草稿 · 左键发送 / 右键取消"; break;
+            case RECORDING: hint = capturing ? "● 正在录音" : "准备录音"; break;
+            case TRANSCRIBING: hint = "正在转写，尚未发送"; break;
+            case DRAFT: hint = "草稿未发送"; break;
             case SENDING: hint = "正在发送一次，等待受理回执…"; break;
-            case UNKNOWN: hint = "发送结果未知：请先在 Cockpit 查看，禁止重发 · 右键仅清除本地草稿"; break;
-            default: hint = "按住确定键说话 · 上下滚动 · 返回键设置";
+            case UNKNOWN: hint = "发送结果未知，请在 Cockpit 核对，禁止重发"; break;
+            default: hint = sessionStatus();
         }
         status.setText(hint + (notice.isEmpty() ? "" : "\n" + notice)
-                + (receipt.isEmpty() ? "" : "\n" + receipt)
                 + (updateNotice.isEmpty() ? "" : "\n" + updateNotice));
         status.setTextColor(capturing ? Color.rgb(255, 105, 105) : Color.LTGRAY);
         if (updater != null) main.post(updater::presentIfReady);
+    }
+
+    private String sessionStatus() {
+        if (!connected || meta == null) return "未连接";
+        if (PendingDecision.ask(meta) != null) return "等待回答";
+        if (PendingDecision.requiresCockpit(meta)) return "等待处理";
+        if (meta.optBoolean("compacting")) return "正在压缩上下文";
+        if ("error".equals(meta.optString("status"))) return "会话异常，请在 Cockpit 查看";
+        JSONObject activity = meta.optJSONObject("activity");
+        if ("running".equals(meta.optString("status")) || (activity != null
+                && (activity.optBoolean("processing") || activity.optBoolean("hasActiveWork")))) return "运行中";
+        if (activity != null) {
+            JSONObject queue = activity.optJSONObject("queue");
+            if (queue != null && (queue.optInt("pendingCount") > 0
+                    || queue.optInt("steeringCount") > queue.optInt("inFlightSteeringCount"))) return "等待处理";
+        }
+        if (meta.has("activity") && activity == null) return "已连接 · 活动状态暂不可用";
+        return "已连接";
     }
 
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
@@ -443,12 +504,25 @@ public final class MainActivity extends Activity {
         }
         if (key == KeyEvent.KEYCODE_DPAD_UP || key == KeyEvent.KEYCODE_DPAD_DOWN) {
             if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                if (previewKey != -1) return true;
+                if (state.phase == RemoteState.Phase.IDLE || state.phase == RemoteState.Phase.DRAFT) {
+                    boolean selected = activeQuestion.selectedChoice() != null;
+                    if (selected || atBottom()) {
+                        int direction = key == KeyEvent.KEYCODE_DPAD_UP ? -1 : 1;
+                        if (activeQuestion.move(direction)) return true;
+                        if (selected && direction > 0) return true;
+                        if (selected) activeQuestion.clearSelection();
+                    }
+                }
                 if (key == KeyEvent.KEYCODE_DPAD_UP && scroll.getScrollY() == 0 && event.getRepeatCount() == 0) readPage(true);
                 scroll.smoothScrollBy(0, (key == KeyEvent.KEYCODE_DPAD_UP ? -1 : 1) * scroll.getHeight() / 3);
             }
             return true;
         }
         if (key == 23 || key == 66 || key == 160 || key == 21 || key == 22) {
+            if (key == 21) cancelPendingConfirm();
+            if (key == 22 && previewKey != -1) return true;
+            if (handleChoiceConfirm(event)) return true;
             RemoteState.Action action = event.getAction() == KeyEvent.ACTION_DOWN
                     ? state.down(key, event.getRepeatCount()) : event.isCanceled() ? RemoteState.Action.NONE : state.up(key);
             if (event.isCanceled()) interruptRecording();
@@ -468,27 +542,87 @@ public final class MainActivity extends Activity {
                 default: break;
             }
             renderState();
+            if (action == RemoteState.Action.NONE && (key == 21 || key == 22)
+                    && state.phase == RemoteState.Phase.IDLE) return super.dispatchKeyEvent(event);
             return true;
         }
         return super.dispatchKeyEvent(event);
     }
 
+    private boolean handleChoiceConfirm(KeyEvent event) {
+        int key = event.getKeyCode();
+        if (key != 23 && key != 66 && key != 160) return false;
+        if (previewKey == key) {
+            if (event.getAction() == KeyEvent.ACTION_UP) {
+                String request = previewRequest, answer = previewAnswer;
+                cancelPendingConfirm();
+                if (!event.isCanceled()) previewChoice(request, answer);
+            }
+            return true;
+        }
+        if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0
+                && activeQuestion.selectedChoice() != null
+                && (state.phase == RemoteState.Phase.IDLE || state.phase == RemoteState.Phase.DRAFT)) {
+            previewKey = key;
+            previewRequest = activeQuestion.requestId();
+            previewAnswer = activeQuestion.selectedChoice();
+            main.postDelayed(recordAfterHold, ViewConfiguration.getLongPressTimeout());
+            return true;
+        }
+        return false;
+    }
+
+    private final Runnable recordAfterHold = () -> {
+        int key = previewKey;
+        boolean current = previewRequest.equals(activeQuestion.requestId());
+        cancelPendingConfirm();
+        if (key != -1 && current && foreground && !dialog && !storageFailed
+                && state.down(key, 0) == RemoteState.Action.START) {
+            startRecording();
+            renderState();
+        }
+    };
+
+    private void cancelPendingConfirm() {
+        main.removeCallbacks(recordAfterHold);
+        previewKey = -1;
+        previewRequest = "";
+        previewAnswer = "";
+    }
+
+    private void previewChoice(String requestId, String choice) {
+        if (!foreground || !connected || storageFailed || dialog
+                || (state.phase != RemoteState.Phase.IDLE && state.phase != RemoteState.Phase.DRAFT)) return;
+        JSONObject ask = PendingDecision.ask(meta);
+        if (ask == null || !requestId.equals(ask.optString("requestId"))) return;
+        JSONArray choices = ask.optJSONArray("choices");
+        boolean validChoice = false;
+        if (choices != null) for (int i = 0; i < choices.length(); i++) {
+            if (choice.equals(choices.optString(i))) validChoice = true;
+        }
+        if (!validChoice) return;
+        state.transcript(choice);
+        target = ask;
+        notice = "";
+        persist();
+        renderState();
+        scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
+    }
+
     private void startRecording() {
         if (!foreground || !connected || storageFailed || meta == null) {
-            state.clear(); notice = "请先完成连接，未打开麦克风"; return;
+            state.interrupt(); notice = "请先完成连接，未打开麦克风"; return;
         }
-        JSONArray decisions = meta.optJSONArray("decisions");
-        if (meta.optJSONObject("planRequest") != null || meta.optJSONObject("elicitation") != null
-                || (decisions != null && decisions.length() > 1)) {
-            state.clear(); notice = "当前原生待决状态需在 Cockpit 处理，不会猜测或自动批准"; return;
+        if (PendingDecision.requiresCockpit(meta)) {
+            state.interrupt(); notice = "当前原生待决状态需在 Cockpit 处理，不会猜测或自动批准"; return;
         }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            state.clear();
+            state.interrupt();
             notice = "请允许麦克风权限，然后重新按住确定键";
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1);
             return;
         }
-        target = meta.optJSONObject("ask");
+        if (state.draft.trim().isEmpty()) target = PendingDecision.ask(meta);
         capturing = false;
         notice = "正在打开 USB 麦克风，请等采音提示";
         receipt = "";
@@ -496,7 +630,7 @@ public final class MainActivity extends Activity {
         capture = new AudioCapture(this, new AudioCapture.Listener() {
             @Override public void onStarted(String device) {
                 if (recordingValid(epoch) && state.phase == RemoteState.Phase.RECORDING) {
-                    capturing = true; notice = "USB 麦克风：" + device; renderState();
+                    capturing = true; notice = ""; renderState();
                 }
             }
             @Override public void onComplete(byte[] pcm) {
@@ -508,7 +642,11 @@ public final class MainActivity extends Activity {
                 transcribe(epoch, pcm);
             }
             @Override public void onError(String message) {
-                if (recordingValid(epoch)) { capturing = false; state.clear(); target = null; notice = message; renderState(); }
+                if (recordingValid(epoch)) {
+                    interruptRecording();
+                    notice = message;
+                    renderState();
+                }
             }
         });
         capture.start();
@@ -531,7 +669,8 @@ public final class MainActivity extends Activity {
                         @Override public void onComplete(String text) {
                             if (!recordingValid(epoch)) return;
                             speech = null;
-                            state.transcript(text);
+                            if (!state.finishSegment(text)) return;
+                            if (state.draft.trim().isEmpty()) target = null;
                             notice = text.trim().isEmpty() ? "未识别到文字，未发送" : "";
                             persist();
                             renderState();
@@ -540,8 +679,7 @@ public final class MainActivity extends Activity {
                         @Override public void onError(String message) {
                             if (!recordingValid(epoch)) return;
                             speech = null;
-                            state.clear();
-                            target = null;
+                            interruptRecording();
                             notice = message + "；未发送，请重新录音";
                             renderState();
                         }
@@ -553,7 +691,7 @@ public final class MainActivity extends Activity {
                 Arrays.fill(pcm, (byte) 0);
                 main.post(() -> {
                     if (!recordingValid(epoch)) return;
-                    state.clear(); target = null;
+                    interruptRecording();
                     notice = "获取转写凭证失败：" + safe(error) + "；未发送";
                     renderState();
                 });
@@ -571,8 +709,9 @@ public final class MainActivity extends Activity {
         if (speech != null) speech.cancel();
         capture = null; speech = null;
         state.interrupt();
-        target = null;
-        notice = "录音或转写已因离开前台／失去焦点中止，未发送";
+        if (state.draft.trim().isEmpty()) target = null;
+        notice = "本段录音或转写已中止，原有草稿保留，未发送";
+        persist();
         renderState();
     }
 
@@ -617,7 +756,9 @@ public final class MainActivity extends Activity {
     }
 
     private void discard() {
-        if (state.phase == RemoteState.Phase.UNKNOWN) {
+        if (state.phase == RemoteState.Phase.RECORDING || state.phase == RemoteState.Phase.TRANSCRIBING) {
+            interruptRecording();
+        } else if (state.phase == RemoteState.Phase.UNKNOWN) {
             dialog = true;
             new AlertDialog.Builder(this).setMessage("这条消息可能已经发送。清除只删除本地草稿，不撤回消息，也不重发。")
                     .setPositiveButton("仅清除本地", (d, which) -> clearDraft())
@@ -639,14 +780,29 @@ public final class MainActivity extends Activity {
         renderState();
     }
 
+    private void editDraft() {
+        if (!foreground || dialog || storageFailed || state.phase != RemoteState.Phase.DRAFT) return;
+        EditText input = new EditText(this);
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+        input.setText(state.draft);
+        AlertDialog box = new AlertDialog.Builder(this).setTitle("编辑草稿")
+                .setView(input).setPositiveButton("保存草稿", (d, w) -> {
+                    state.transcript(input.getText().toString());
+                    if (state.draft.trim().isEmpty()) target = null;
+                    persist();
+                }).setNegativeButton("返回", null).create();
+        showNavigation(box, new Runnable[1], this::renderState);
+    }
+
     private void showMenu() {
         if (dialog) return;
+        cancelPendingConfirm();
         interruptRecording();
         Runnable[] after = new Runnable[1];
         AlertDialog box = new AlertDialog.Builder(this).setTitle("Cockpit Dashboard")
                 .setItems(new String[]{"返回聊天", "重新连接（不重发）", "选择会话", "高级连接设置",
                         "扫码登录（手机批准）", "退出登录（仅本机）", "检查应用更新", "关闭 App（保留登录）",
-                        "撤销此设备的服务端授权", "Passkey 登录（高级原生兼容）"},
+                        "撤销此设备的服务端授权", "Passkey 登录（高级原生兼容）", "操作说明与诊断"},
                         (d, which) -> {
                             if (which == 1) after[0] = this::connect;
                             if (which == 2) after[0] = this::chooseSession;
@@ -657,11 +813,55 @@ public final class MainActivity extends Activity {
                             if (which == 7) after[0] = this::finish;
                             if (which == 8) after[0] = this::confirmRevoke;
                             if (which == 9) after[0] = this::startLogin;
+                            if (which == 10) after[0] = this::showHelp;
                         }).create();
         showNavigation(box, after, () -> {});
     }
 
+    private void recordUpdateDiagnostic(String message) {
+        if (storageFailed) return;
+        JSONArray prior = settings.optJSONArray("updateDiagnostics");
+        JSONArray bounded = new JSONArray();
+        if (prior != null) {
+            for (int i = Math.max(0, prior.length() - 15); i < prior.length(); i++) {
+                String entry = prior.optString(i);
+                bounded.put(entry.substring(0, Math.min(entry.length(), 600)));
+            }
+        }
+        bounded.put(message.substring(0, Math.min(message.length(), 600)));
+        try {
+            settings.put("updateDiagnostics", bounded);
+            persist();
+        } catch (JSONException error) {
+            storageFailed = true;
+            notice = "诊断信息无法保存，已禁止发送";
+        }
+    }
+
+    private void showHelp() {
+        StringBuilder contents = new StringBuilder("操作说明\n"
+                + "长按确定：录音；松开：转写为草稿，不自动发送。\n"
+                + "有草稿时再次录音：追加一段；失败、空结果或取消本段保留原稿。\n"
+                + "左键：取消本段录音或当前草稿；右键：发送草稿一次。\n"
+                + "上下键：滚动聊天或选择当前问题选项；短按确定：预览选项答案。\n"
+                + "点击草稿可编辑；历史问题不能再次提交。\n\n应用更新诊断（最近 16 条）\n");
+        JSONArray logs = settings.optJSONArray("updateDiagnostics");
+        if (logs == null || logs.length() == 0) contents.append("暂无诊断");
+        else for (int i = logs.length() - 1; i >= Math.max(0, logs.length() - 16); i--) {
+            String entry = logs.optString(i);
+            contents.append(entry, 0, Math.min(entry.length(), 600)).append("\n\n");
+        }
+        TextView body = text(18, Color.LTGRAY);
+        body.setText(contents.toString());
+        ScrollView container = new ScrollView(this);
+        container.addView(body);
+        AlertDialog box = new AlertDialog.Builder(this).setTitle("操作说明与诊断")
+                .setView(container).setPositiveButton("返回", null).create();
+        showNavigation(box, new Runnable[1], () -> {});
+    }
+
     private void showNavigation(AlertDialog box, Runnable[] after, Runnable cleanup) {
+        cancelPendingConfirm();
         navigation = box;
         dialog = true;
         box.setOnDismissListener(d -> {
@@ -828,6 +1028,7 @@ public final class MainActivity extends Activity {
     }
 
     private void disconnect() {
+        cancelPendingConfirm();
         cancelDirectory();
         connectionEpoch++;
         connected = false;

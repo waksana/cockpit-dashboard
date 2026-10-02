@@ -14,25 +14,36 @@ answer mode is involved.
 | --- | --- |
 | Hold confirm (`DPAD_CENTER`, `ENTER`, `NUMPAD_ENTER`) | Capture from a detected USB audio input. Wait for the actual recording indicator. Repeats do not restart capture. |
 | Release confirm | Stop capture and transcribe; **never send automatically**. |
-| Left | Send an available draft once to the configured session. |
-| Right | Discard this draft/recording, not an already accepted task. |
-| Up / down | Scroll chat. At the top, another up press loads older history. |
+| Left | Cancel the current recording segment, or discard a completed draft; never cancel an already accepted task. |
+| Right | Send an available draft once to its original destination. |
+| Up / down | Select options in the current question at the bottom of chat, or scroll chat. Moving above the first option returns to chat scrolling; at the top, another up press loads older history. |
+| Short confirm on a selected option | Preview the exact option as a draft, without sending. Hold instead to record. |
 | Back / menu | Return, reconnect, choose a session, advanced settings or exit. |
 
 The same input answers the session's current native `ask` when one was present
 at recording start. The original request identity is retained through preview.
 Stale questions cannot silently turn into prompts. Native choice-only questions
-require speaking an exact offered answer; the app does not guess or relax the
-backend's free-text policy. Native plan/elicitation requests and multiple
+accept an exact offered option selected with the remote/touch, or spoken verbatim;
+the app does not guess or relax the backend's free-text policy. Native plan/elicitation requests and multiple
 simultaneous native decisions must be handled in Cockpit; the app never
 automatically approves them. Ordinary conversational clarifications require no
 special handling.
 
-Recording stops and is discarded on focus loss, leaving the foreground or
-cancellation. Maximum capture length is 120 seconds. Audio exists only in memory,
+Recording stops on focus loss, leaving the foreground or cancellation.
+Holding confirm again with an existing draft appends a new transcription segment
+with a newline, preserving manually edited text and the original answer target.
+Tap the draft to edit it. Cancellation, failures and empty results retain the
+previous draft; repeat/final/late callbacks cannot append a segment twice.
+Maximum capture length is 120 seconds. Audio exists only in memory,
 not in files or backups. Transcription happens after capture, not live while
 speaking. A transcription failure requires a new recording. Empty text cannot
-be sent. Right cancellation cannot undo already incurred Azure processing/cost.
+be sent. Left cancellation cannot undo already incurred Azure processing/cost.
+
+The chat footer only shows essential state and failures, without expandable
+tool/thinking details. Permanent key instructions and routine update messages
+live under **Settings > Operation instructions and diagnostics** instead of chat.
+There is no visibility toggle. Update diagnostics retain at most 16 entries of
+600 characters in the existing encrypted store, never audio or message bodies.
 
 ## Requirements and connection
 
@@ -214,10 +225,33 @@ read passively; explicitly sending a prompt lets the host resume that existing
 session. Cursor expiry/disconnection requires explicit reconnect, never resend.
 Transient deltas missed during disconnect are not guaranteed to be recovered.
 
-Only user/assistant messages and session errors are shown. Tool traces and
-subagent messages are not a second conversation. Attachments are noted, not
-downloaded. Markdown and URLs remain readable; this is not the full Cockpit
-workbench. Native history, not local optimistic bubbles, determines chat content.
+User/assistant messages, user-facing questions/answers and session errors are
+shown; generic tool traces, logs, thinking and child-agent messages are hidden.
+Attachments are noted, not downloaded. Markwon renders the same Markdown path
+for live/replayed messages and questions: headings, lists, quotes, emphasis,
+code, safe explicit web links and horizontally scrollable tables. Long code
+wraps; HTML stays inert and images never trigger automatic downloads.
+This is not the full Cockpit workbench. Native history, not local optimistic
+bubbles, determines chat content.
+
+Historical `ask_user` questions and choices come from attributed
+`tool.execution_start`, embedded assistant `toolRequests`, or native request
+metadata. Actual answers come from the matching durable `tool.execution_complete`
+and its affirmative `User selected:` / `User responded:` result, with failure,
+dismissal and outcome guards. Ephemeral `user_input.completed`, local submit
+receipts and disappearing pending controls are not saved-answer evidence.
+Earlier pages can repair a question whose completion arrived first; event IDs
+deduplicate overlap and exact invocation identities prevent cross-question
+matching. Missing answers stay unconfirmed, never synthesized or retried.
+This follows the public Web reducer and synthetic tests at
+[Cockpit 627270a](https://github.com/waksana/cockpit/blob/627270a248f634e977dd96fd8ee2d8c70d1288fc/packages/protocol/src/chat.ts).
+
+History is read-only. Only current metadata supplies an actionable question;
+an explicit `decisions` array supersedes the legacy singular `ask`, including
+when empty. Host callback request IDs are not native tool-call IDs, so the app
+does not match historical and pending cards by text, time or assumed ID aliases.
+Web-origin answers use the same durable result path. Old records without
+attributable results cannot be recovered by inventing an answer.
 
 `prompt` uses `mode:"enqueue"`. An accepted or queued receipt is not completion.
 The client persists a sending marker **before** mutation and never automatically
@@ -267,13 +301,14 @@ version code, version name, minimum SDK and the exact installed single signing
 certificate. Signing rotation and downgrades are not supported. Public GitHub
 traffic has a separate client and carries no Cockpit credentials.
 
-Failures display a fixed stage/reason code and relevant numeric facts on screen,
-and write the same sanitized diagnostic under the Android log tag
+Failures remain visible as a short chat notice. **Operation instructions and
+diagnostics** shows the fixed stage/reason code and relevant numeric facts,
+and the updater writes the same sanitized diagnostic under the Android log tag
 `DashboardUpdater`. Stages distinguish release/manifest requests, APK download
 and storage, file hash/size, package parsing, version/minimum API, installed/APK
 signers, and launching system settings or the installer. The diagnostic includes
 the device's Android API and target version code when known; HTTP failures include
-the status code. Photograph the message for troubleshooting; ADB is not required.
+the status code. Photograph the settings diagnostic for troubleshooting; ADB is not required.
 Logs omit response bodies, URLs, credentials, exception text and stack traces.
 Cancellation does not emit a late failure log. These diagnostics do not establish
 the cause of a previously observed device failure.

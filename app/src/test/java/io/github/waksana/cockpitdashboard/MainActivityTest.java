@@ -51,9 +51,9 @@ public class MainActivityTest {
             MainActivity activity = controller.get();
             RemoteState state = state(activity);
             state.transcript("draft");
-            activity.dispatchKeyEvent(new KeyEvent(0, 0, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_LEFT, 2));
+            activity.dispatchKeyEvent(new KeyEvent(0, 0, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_RIGHT, 2));
             assertEquals(RemoteState.Phase.DRAFT, state.phase);
-            activity.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_LEFT));
+            activity.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_RIGHT));
             assertEquals(RemoteState.Phase.DRAFT, state.phase);
             assertEquals("draft", state.draft);
         }
@@ -69,6 +69,27 @@ public class MainActivityTest {
             assertEquals("", state.draft);
         }
 
+    }
+
+    @Test public void appendWithoutConnectionOrCancelledSegmentKeepsDraftAndOriginalAsk() throws Exception {
+        try (ActivityController<MainActivity> controller = Robolectric.buildActivity(MainActivity.class).create()) {
+            MainActivity activity = controller.get();
+            RemoteState state = state(activity);
+            JSONObject target = new JSONObject().put("requestId", "old-question");
+            set(activity, "target", target);
+            state.transcript("edited original");
+            activity.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_CENTER));
+            assertEquals(RemoteState.Phase.DRAFT, state.phase);
+            assertEquals("edited original", state.draft);
+            state.down(KeyEvent.KEYCODE_DPAD_CENTER, 0);
+            activity.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_LEFT));
+            assertEquals("edited original", state.draft);
+            assertEquals(RemoteState.Phase.DRAFT, state.phase);
+            assertFalse(state.finishSegment("late result"));
+            Field field = MainActivity.class.getDeclaredField("target");
+            field.setAccessible(true);
+            assertSame(target, field.get(activity));
+        }
     }
 
     @Test public void closingAndBackgroundKeepLoginAndUnknownDraft() throws Exception {
