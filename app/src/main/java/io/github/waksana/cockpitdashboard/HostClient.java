@@ -212,7 +212,8 @@ final class HostClient {
         if (cursor != null) body.put("cursor", cursor);
         if (live) {
             body.put("agentScope", "primary").put("types", new JSONArray()
-                    .put("user.message").put("assistant.message").put("assistant.message_delta")
+                    .put("user.message").put("assistant.message_start").put("assistant.message").put("assistant.message_delta")
+                    .put("tool.execution_start").put("tool.execution_complete")
                     .put("user_input.requested").put("user_input.completed").put("session.error"));
             if ("forward".equals(direction)) body.put("includeEphemeral", true);
         }
@@ -249,7 +250,7 @@ final class HostClient {
         JSONObject body = new JSONObject().put("sessionId", sessionId);
         JSONObject result;
         if (target != null) {
-            JSONObject current = meta().optJSONObject("ask");
+            JSONObject current = PendingDecision.ask(meta());
             if (current == null || !target.getString("requestId").equals(current.getString("requestId"))) {
                 throw new Rejected("原问题已结束或变化，草稿保留；不会转发成新消息");
             }

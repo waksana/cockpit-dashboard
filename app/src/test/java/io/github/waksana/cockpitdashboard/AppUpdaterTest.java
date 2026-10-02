@@ -15,6 +15,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
@@ -55,6 +56,7 @@ public class AppUpdaterTest {
     private AppUpdater updater;
     private boolean ready = true;
     private final List<String> statuses = new ArrayList<>();
+    private final List<String> failures = new ArrayList<>();
     private UpdateClient.Update update;
 
     public static class TestActivity extends Activity {
@@ -96,6 +98,7 @@ public class AppUpdaterTest {
         updater = new AppUpdater(activity, new AppUpdater.Listener() {
             @Override public boolean isReady() { return ready; }
             @Override public void status(String message) { statuses.add(message); }
+            @Override public void failure(String message) { failures.add(message); statuses.add(message); }
         }, client);
         updater.resume();
     }
@@ -104,6 +107,25 @@ public class AppUpdaterTest {
         Field field = AppUpdater.class.getDeclaredField(name);
         field.setAccessible(true);
         field.set(updater, value);
+    }
+
+    @Test public void deferredFailureAndLaterInterruptedOperationKeepDistinctNoticeKinds() throws Exception {
+        create(synthetic(chain -> response(chain, new byte[0])));
+        ready = false;
+        Method status = AppUpdater.class.getDeclaredMethod("status", String.class, boolean.class);
+        status.setAccessible(true);
+        status.invoke(updater, "safe failure", true);
+        updater.presentIfReady();
+        assertTrue(failures.isEmpty());
+        ready = true;
+        updater.presentIfReady();
+        assertEquals(1, failures.size());
+        field("busy", true);
+        field("cancellation", new UpdateClient.Cancellation());
+        updater.pause();
+        updater.resume();
+        assertEquals(1, failures.size());
+        assertTrue(statuses.get(statuses.size() - 1).contains("已中断"));
     }
 
     private static PackageInfo packageInfo(String name, int version, int minSdk, String certificate) {
