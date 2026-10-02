@@ -1,6 +1,9 @@
 package io.github.waksana.cockpitdashboard;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import okhttp3.HttpUrl;
 import okhttp3.MediaType;
@@ -153,9 +156,37 @@ final class HostClient {
     }
 
     SessionDirectory directory(String cursor) throws IOException, JSONException {
-        JSONObject body = new JSONObject().put("limit", SessionDirectory.PAGE_SIZE);
-        if (cursor != null) body.put("cursor", cursor);
-        return new SessionDirectory(intent("session/directory", body));
+        return directory(cursor, () -> false);
+    }
+
+    interface DirectoryCancellation {
+        boolean isCancelled();
+    }
+
+    SessionDirectory directory(String cursor, DirectoryCancellation cancelled) throws IOException, JSONException {
+        Set<String> seen = new HashSet<>();
+        SessionDirectory page;
+        int scanned = 0;
+        do {
+            checkDirectoryCancellation(cancelled);
+            if (!seen.add(cursor)) throw new IOException("会话目录游标重复，请重新读取");
+            JSONObject body = new JSONObject().put("limit", SessionDirectory.PAGE_SIZE);
+            if (cursor != null) body.put("cursor", cursor);
+            page = new SessionDirectory(intent("session/directory", body));
+            checkDirectoryCancellation(cancelled);
+            if (page.next != null && seen.contains(page.next)) {
+                throw new IOException("会话目录游标重复，请重新读取");
+            }
+            cursor = page.next;
+            scanned++;
+        } while (page.entries.isEmpty() && cursor != null && scanned < SessionDirectory.MAX_SCAN_PAGES);
+        return page;
+    }
+
+    private static void checkDirectoryCancellation(DirectoryCancellation cancelled) throws InterruptedIOException {
+        if (cancelled.isCancelled() || Thread.currentThread().isInterrupted()) {
+            throw new InterruptedIOException("会话查找已取消");
+        }
     }
 
     JSONObject meta() throws IOException, JSONException {
