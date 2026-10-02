@@ -7,6 +7,12 @@ import android.widget.EditText;
 import android.os.Looper;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InterruptedIOException;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import okhttp3.OkHttpClient;
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
@@ -34,7 +40,7 @@ public class SessionDirectoryTest {
     }
 
     private JSONArray assistantRoles() throws JSONException {
-        return new JSONArray().put(new JSONObject().put("moduleId", "assistant").put("roleId", "assistant"));
+        return new JSONArray().put(new JSONObject().put("moduleId", "assistant").put("roleId", "coordinator"));
     }
 
     @Test public void directoryFiltersConfiguredAssistantRoleNotAppliedRoleNameOrStatus() throws Exception {
@@ -47,11 +53,17 @@ public class SessionDirectoryTest {
                 .put(entry("name-only", "Assistant").put("roles", new JSONArray().put(
                         new JSONObject().put("moduleId", "assistant").put("roleId", "node").put("name", "assistant"))))
                 .put(entry("substring", "Assistant").put("roles", new JSONArray().put(
-                        new JSONObject().put("roleId", "assistant-extra"))))
+                        new JSONObject().put("moduleId", "assistant").put("roleId", "coordinator-extra"))))
+                .put(entry("wrong-module", "Assistant").put("roles", new JSONArray().put(
+                        new JSONObject().put("moduleId", "other").put("roleId", "coordinator"))))
+                .put(entry("old-bug", "Assistant").put("roles", new JSONArray().put(
+                        new JSONObject().put("moduleId", "assistant").put("roleId", "assistant"))))
+                .put(entry("organizer", "Assistant").put("roles", new JSONArray().put(
+                        new JSONObject().put("moduleId", "assistant").put("roleId", "organizer"))))
                 .put(entry("configured", "Same").put("rolesNeedReload", true)
                         .put("appliedRoles", new JSONArray()).put("roles", new JSONArray()
                                 .put(new JSONObject().put("moduleId", "other").put("roleId", "node"))
-                                .put(new JSONObject().put("moduleId", "another").put("roleId", "assistant"))));
+                                .put(new JSONObject().put("moduleId", "assistant").put("roleId", "coordinator"))));
         SessionDirectory page = new SessionDirectory(new JSONObject().put("sessions", rows).put("cursor", "opaque"));
         assertEquals(4, page.entries.size());
         assertEquals("assistant", page.entries.get(0).id);
@@ -90,11 +102,8 @@ public class SessionDirectoryTest {
             server.enqueue(new MockResponse().setBody(new JSONObject().put("sessions", new JSONArray()
                     .put(entry("assistant", "Match").put("roles", assistantRoles()))).toString()));
             SessionDirectory firstPage = client.directory(null);
-            assertTrue(firstPage.entries.isEmpty());
-            assertEquals("next", firstPage.next);
-            SessionDirectory nextPage = client.directory("next");
-            assertEquals("assistant", nextPage.entries.get(0).id);
-            assertNull(nextPage.next);
+            assertEquals("assistant", firstPage.entries.get(0).id);
+            assertNull(firstPage.next);
             RecordedRequest first = server.takeRequest(), second = server.takeRequest();
             assertEquals("/intent/session/directory", first.getPath());
             assertEquals("/intent/session/directory", second.getPath());
@@ -104,6 +113,89 @@ public class SessionDirectoryTest {
             assertFalse(next.has("roles"));
             assertFalse(next.has("sessionId"));
             assertEquals(2, server.getRequestCount());
+        }
+    }
+
+    @Test @Config(sdk = {23, 28})
+    public void actualRoleContractFindsAssistantAfterSkippingUnmatchedPagesAndCanGoBack() throws Exception {
+        // Anonymized shape from the passive Host directory, including the real catalog identity.
+        JSONArray pages;
+        try (InputStream input = getClass().getResourceAsStream("/assistant-directory-contract.json")) {
+            assertNotNull(input);
+            pages = new JSONObject(new String(input.readAllBytes(), StandardCharsets.UTF_8)).getJSONArray("pages");
+        }
+        try (MockWebServer server = new MockWebServer()) {
+            server.start();
+            HostClient client = new HostClient(server.url("/"), "", "", new OkHttpClient());
+            for (int i = 0; i < pages.length(); i++) server.enqueue(new MockResponse().setBody(pages.getJSONObject(i).toString()));
+            SessionDirectory first = client.directory(null);
+            assertEquals(1, first.entries.size());
+            assertEquals("actual-assistant", first.entries.get(0).id);
+            assertEquals("opaque:200", first.next);
+            assertEquals(4, server.getRequestCount());
+            SessionDirectory end = client.directory(first.next);
+            assertTrue(end.entries.isEmpty());
+            assertNull(end.next);
+            for (int i = 0; i < pages.length(); i++) {
+                RecordedRequest request = server.takeRequest();
+                assertEquals("/intent/session/directory", request.getPath());
+                JSONObject body = new JSONObject(request.getBody().readUtf8());
+                assertEquals(50, body.getInt("limit"));
+                if (i == 0) assertFalse(body.has("cursor"));
+                else assertEquals(pages.getJSONObject(i - 1).getString("cursor"), body.getString("cursor"));
+            }
+            for (int i = 0; i < 4; i++) server.enqueue(new MockResponse().setBody(pages.getJSONObject(i).toString()));
+            assertEquals(first.entries.get(0).id, client.directory(null).entries.get(0).id);
+            assertEquals(9, server.getRequestCount());
+        }
+    }
+
+    @Test @Config(sdk = {23, 28})
+    public void directoryCancellationStopsBeforeFirstRequestAndBetweenPages() throws Exception {
+        try (MockWebServer server = new MockWebServer()) {
+            server.start();
+            HostClient client = new HostClient(server.url("/"), "", "", new OkHttpClient());
+            assertThrows(InterruptedIOException.class, () -> client.directory(null, () -> true));
+            assertEquals(0, server.getRequestCount());
+            server.enqueue(new MockResponse().setBody("{\"sessions\":[],\"cursor\":\"next\"}"));
+            AtomicInteger checks = new AtomicInteger();
+            assertThrows(InterruptedIOException.class,
+                    () -> client.directory(null, () -> checks.incrementAndGet() >= 2));
+            assertEquals(1, server.getRequestCount());
+        }
+    }
+
+    @Test public void directoryStopsAtBudgetWithoutClaimingEndAndResumesExactly() throws Exception {
+        try (MockWebServer server = new MockWebServer()) {
+            server.start();
+            HostClient client = new HostClient(server.url("/"), "", "", new OkHttpClient());
+            for (int i = 1; i <= SessionDirectory.MAX_SCAN_PAGES; i++) {
+                server.enqueue(new MockResponse().setBody("{\"sessions\":[],\"cursor\":\"next-" + i + "\"}"));
+            }
+            SessionDirectory page = client.directory(null);
+            assertTrue(page.entries.isEmpty());
+            assertEquals("next-" + SessionDirectory.MAX_SCAN_PAGES, page.next);
+            assertEquals(SessionDirectory.MAX_SCAN_PAGES, server.getRequestCount());
+            for (int i = 0; i < SessionDirectory.MAX_SCAN_PAGES; i++) server.takeRequest();
+            server.enqueue(new MockResponse().setBody(new JSONObject().put("sessions",
+                    new JSONArray().put(entry("found", "Assistant").put("roles", assistantRoles()))).toString()));
+            assertEquals("found", client.directory(page.next).entries.get(0).id);
+            assertEquals(page.next, new JSONObject(server.takeRequest().getBody().readUtf8()).getString("cursor"));
+        }
+    }
+
+    @Test public void directoryRejectsCursorCyclesAndDoesNotRestartAfterInvalidation() throws Exception {
+        try (MockWebServer server = new MockWebServer()) {
+            server.start();
+            HostClient client = new HostClient(server.url("/"), "", "", new OkHttpClient());
+            server.enqueue(new MockResponse().setBody("{\"sessions\":[],\"cursor\":\"again\"}"));
+            server.enqueue(new MockResponse().setBody("{\"sessions\":[],\"cursor\":\"again\"}"));
+            assertThrows(IOException.class, () -> client.directory(null));
+            assertEquals(2, server.getRequestCount());
+            server.enqueue(new MockResponse().setBody("{\"sessions\":[],\"cursor\":\"changed\"}"));
+            server.enqueue(new MockResponse().setResponseCode(409).setBody("{}"));
+            assertThrows(HostClient.Rejected.class, () -> client.directory(null));
+            assertEquals(4, server.getRequestCount());
         }
     }
 
@@ -126,13 +218,29 @@ public class SessionDirectoryTest {
             show.setAccessible(true);
             show.invoke(activity, page, new java.util.ArrayList<String>(), null);
             AlertDialog dialog = ShadowAlertDialog.getLatestAlertDialog();
-            assertTrue(shadowOf(dialog).getTitle().toString().contains("assistant"));
-            assertTrue(shadowOf(dialog).getMessage().toString().contains("下一页"));
-            assertEquals("下一页", dialog.getButton(AlertDialog.BUTTON_POSITIVE).getText().toString());
+            assertTrue(shadowOf(dialog).getTitle().toString().contains("Assistant"));
+            assertTrue(shadowOf(dialog).getMessage().toString().contains("尚未查完"));
+            assertEquals("继续查找", dialog.getButton(AlertDialog.BUTTON_POSITIVE).getText().toString());
             assertEquals(View.VISIBLE, dialog.getButton(AlertDialog.BUTTON_POSITIVE).getVisibility());
             assertFalse(((JSONObject) get(activity, "settings")).has("sessionId"));
             activity.onPause();
             shadowOf(Looper.getMainLooper()).idle();
+        }
+    }
+
+    @Test public void leavingForegroundCancelsDirectoryScanWithoutChangingSelection() throws Exception {
+        try (ActivityController<MainActivity> controller = Robolectric.buildActivity(MainActivity.class).create()) {
+            MainActivity activity = controller.get();
+            AtomicBoolean cancellation = new AtomicBoolean();
+            Field field = MainActivity.class.getDeclaredField("directoryCancellation");
+            field.setAccessible(true);
+            field.set(activity, cancellation);
+            JSONObject settings = (JSONObject) get(activity, "settings");
+            settings.put("sessionId", "keep");
+            activity.onPause();
+            assertTrue(cancellation.get());
+            assertNull(field.get(activity));
+            assertEquals("keep", settings.getString("sessionId"));
         }
     }
 

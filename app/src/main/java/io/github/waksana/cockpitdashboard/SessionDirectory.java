@@ -10,6 +10,7 @@ import org.json.JSONObject;
 
 final class SessionDirectory {
     static final int PAGE_SIZE = 50;
+    static final int MAX_SCAN_PAGES = 20;
     final List<Entry> entries;
     final String next;
 
@@ -49,7 +50,9 @@ final class SessionDirectory {
         JSONArray roles = item.getJSONArray("roles");
         boolean found = false;
         for (int i = 0; i < roles.length(); i++) {
-            if ("assistant".equals(roles.getJSONObject(i).getString("roleId"))) found = true;
+            JSONObject role = roles.getJSONObject(i);
+            if ("assistant".equals(role.getString("moduleId"))
+                    && "coordinator".equals(role.getString("roleId"))) found = true;
         }
         return found;
     }

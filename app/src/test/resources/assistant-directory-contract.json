@@ -1,0 +1,23 @@
+{
+  "pages": [
+    {
+      "sessions": [{"sessionId": "node-one", "title": "Node one", "cwd": "/project", "roles": [{"moduleId": "cockpit-task", "roleId": "node", "name": "Node", "moduleName": "Tasks"}]}],
+      "cursor": "opaque:50"
+    },
+    {
+      "sessions": [{"sessionId": "ordinary", "title": "Ordinary", "cwd": "/project", "roles": []}],
+      "cursor": "opaque:100"
+    },
+    {
+      "sessions": [{"sessionId": "memory", "title": "Memory", "cwd": "/project", "roles": [{"moduleId": "assistant", "roleId": "memory", "name": "memory", "moduleName": "Assistant"}]}],
+      "cursor": "opaque:150"
+    },
+    {
+      "sessions": [{"sessionId": "actual-assistant", "title": "My assistant", "cwd": "/project", "status": "unloaded", "loaded": false, "roles": [{"moduleId": "assistant", "roleId": "coordinator", "name": "Assistant", "moduleName": "Assistant"}], "appliedRoles": [], "rolesNeedReload": true}],
+      "cursor": "opaque:200"
+    },
+    {
+      "sessions": [{"sessionId": "node-last", "title": "Last node", "cwd": "/project", "roles": [{"moduleId": "cockpit-task", "roleId": "node", "name": "Node", "moduleName": "Tasks"}]}]
+    }
+  ]
+}

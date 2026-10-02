@@ -51,13 +51,19 @@ The app defaults to HTTPS and saves the address locally; no personal host is
 bundled in the source or APK. Select **Save and sign in with QR**, scan with a
 phone and approve with its existing Passkey, then use
 up/down and confirm on the remote to select a session. No session ID typing is
-required. The chooser only displays sessions whose configured `roles` include an
-exact `roleId: "assistant"`, regardless of module ID, loaded state or status.
+required. The chooser only displays sessions whose configured `roles` include
+`moduleId: "assistant", roleId: "coordinator"` (the catalog's **Assistant** role),
+regardless of loaded state or status. Other roles from the assistant module,
+such as organizer or legacy memory, do not qualify.
 Missing roles, `appliedRoles` alone, display names and assistant-authored messages
 do not qualify. There is no show-all option or automatic session selection.
 Titles, working directories and IDs distinguish similarly named entries.
-Next/previous controls traverse bounded directory pages; filtering can leave a
-page empty, so use the next-page button when offered. Listing
+Next/previous controls traverse matching directory pages. Unmatched raw pages are
+skipped automatically, up to 20 requests of 50 entries per search action; if that
+budget is reached before a match or the end, **Continue searching** explicitly
+resumes from the returned cursor without claiming no matches exist.
+Cancelling or leaving the foreground prevents further page requests and ignores
+the in-flight result. Listing
 does not load sessions or read their chats. A changed catalog invalidates its
 cursor; explicitly refresh rather than silently skipping entries.
 

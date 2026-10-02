@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -49,6 +50,7 @@ public final class MainActivity extends Activity {
     private DeviceCredentials deviceCredentials;
     private boolean deviceAvailable, revoking;
     private AlertDialog navigation;
+    private AtomicBoolean directoryCancellation;
     private AppUpdater updater;
     private boolean checkedForUpdates;
     private String updateNotice = "";
@@ -163,6 +165,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onPause() {
         foreground = false;
+        cancelDirectory();
         if (updater != null) updater.pause();
         if (navigation != null) navigation.dismiss();
         if (login != null) login.pause();
@@ -176,6 +179,7 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        cancelDirectory();
         recordingEpoch++;
         connectionEpoch++;
         if (login != null) login.cancel();
@@ -676,7 +680,7 @@ public final class MainActivity extends Activity {
         Runnable[] after = new Runnable[1];
         AlertDialog box = new AlertDialog.Builder(this).setTitle("登录并选择会话")
                 .setMessage(settings.optString("address") + "\n已保存地址，无需输入会话 ID。\n"
-                        + "先扫码登录，再用遥控器从全部会话里选择一个。\n手机使用 Passkey 批准，电视无需凭据提供器。")
+                        + "先扫码登录，再用遥控器选择 Assistant 会话。\n手机使用 Passkey 批准，电视无需凭据提供器。")
                 .setPositiveButton("扫码登录", (d, w) -> after[0] = this::startDeviceLogin)
                 .setNeutralButton("高级设置", (d, w) -> after[0] = this::openSettings)
                 .setNegativeButton("稍后", null).create();
@@ -703,7 +707,7 @@ public final class MainActivity extends Activity {
         disconnect();
         final int epoch = connectionEpoch;
         busyRead = true;
-        notice = "正在读取 assistant 角色会话…";
+        notice = "正在查找 Assistant 角色会话…";
         renderState();
         final HostClient directoryClient;
         try {
@@ -718,24 +722,29 @@ public final class MainActivity extends Activity {
             return;
         }
         Runnable[] after = new Runnable[1];
+        AtomicBoolean cancelled = new AtomicBoolean();
+        directoryCancellation = cancelled;
         AlertDialog loading = new AlertDialog.Builder(this).setTitle("正在读取会话")
-                .setMessage("只显示已配置 assistant 角色的会话；读取目录不会加载会话。")
-                .setNegativeButton("取消", null).create();
+                .setMessage("只显示 Assistant（assistant/coordinator）会话，自动跳过不匹配的目录页，不会加载会话。")
+                .setNegativeButton("取消", (d, w) -> cancelled.set(true)).create();
+        loading.setOnCancelListener(d -> cancelled.set(true));
         showNavigation(loading, after, () -> {
+            cancelled.set(true);
+            if (directoryCancellation == cancelled) directoryCancellation = null;
             connectionEpoch++;
             busyRead = false;
         });
         reads.execute(() -> {
             try {
-                SessionDirectory page = directoryClient.directory(cursor);
+                SessionDirectory page = directoryClient.directory(cursor, cancelled::get);
                 main.post(() -> {
-                    if (!valid(epoch)) return;
+                    if (cancelled.get() || !valid(epoch)) return;
                     after[0] = () -> showDirectory(page, previous, cursor);
                     loading.dismiss();
                 });
             } catch (IOException | JSONException error) {
                 main.post(() -> {
-                    if (!valid(epoch)) return;
+                    if (cancelled.get() || !valid(epoch)) return;
                     after[0] = () -> showDirectoryError(error);
                     loading.dismiss();
                 });
@@ -762,16 +771,18 @@ public final class MainActivity extends Activity {
         String[] labels = new String[page.entries.size()];
         for (int i = 0; i < labels.length; i++) labels[i] = page.entries.get(i).label(settings.optString("sessionId"));
         AlertDialog.Builder builder = new AlertDialog.Builder(this)
-                .setTitle("assistant 会话 · 第 " + (previous.size() + 1) + " 页")
+                .setTitle("Assistant 会话 · 第 " + (previous.size() + 1) + " 页")
                 .setNegativeButton("返回聊天", (d, w) -> after[0] = () -> {
                     if (!settings.optString("sessionId").isEmpty()) connect();
                 });
         if (labels.length == 0) builder.setMessage(page.next != null
-                ? "此页没有配置 assistant 角色的会话，请查看下一页。"
-                : "此页没有配置 assistant 角色的会话；可在 Cockpit 配置角色后重新读取。");
+                ? "已跳过多页不匹配会话，目录尚未查完，请继续查找。"
+                : previous.isEmpty()
+                        ? "未找到配置 Assistant（assistant/coordinator）角色的会话。"
+                        : "后续没有更多 Assistant 会话，可返回上一页。");
         else builder.setItems(labels, (d, which) -> after[0] = () -> selectSession(page.entries.get(which)));
         if (page.next != null) {
-            builder.setPositiveButton("下一页", (d, w) -> {
+            builder.setPositiveButton(labels.length == 0 ? "继续查找" : "下一页", (d, w) -> {
                 List<String> history = new ArrayList<>(previous);
                 history.add(cursor);
                 after[0] = () -> loadDirectory(history, page.next);
@@ -817,11 +828,17 @@ public final class MainActivity extends Activity {
     }
 
     private void disconnect() {
+        cancelDirectory();
         connectionEpoch++;
         connected = false;
         busyRead = false;
         main.removeCallbacks(poll);
         client = null;
+    }
+
+    private void cancelDirectory() {
+        if (directoryCancellation != null) directoryCancellation.set(true);
+        directoryCancellation = null;
     }
 
     private void startDeviceLogin() {
