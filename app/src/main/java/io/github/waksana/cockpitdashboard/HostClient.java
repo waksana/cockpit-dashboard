@@ -102,10 +102,15 @@ final class HostClient {
     }
 
     JSONObject request(String path, JSONObject body) throws IOException, JSONException {
+        return request(path, body, null);
+    }
+
+    private JSONObject request(String path, JSONObject body, String moduleDigest) throws IOException, JSONException {
         HttpUrl url = origin.resolve(path);
         if (url == null || !url.scheme().equals(origin.scheme()) || !url.host().equals(origin.host())
                 || url.port() != origin.port()) throw new Rejected("拒绝跨站请求");
         Request.Builder builder = new Request.Builder().url(url).header("Accept", "application/json");
+        if (moduleDigest != null) builder.header("X-Cockpit-Module-Digest", moduleDigest);
         if (device != null) {
             builder.header("Authorization", device.header(url, token -> new DeviceOAuth(origin, http).refresh(token)));
         } else {
@@ -122,6 +127,9 @@ final class HostClient {
             }
             // A proxy/5xx can fail after the mutation reached the host; never call it rejected.
             if (!response.isSuccessful()) {
+                if (moduleDigest != null && response.code() == 409) {
+                    throw new Rejected("Speech 模块请求冲突（HTTP 409），请检查 App 与模块版本；未上传录音");
+                }
                 String message = "HTTP " + response.code() + "，请检查连接、鉴权及 Cockpit 状态";
                 if (response.code() >= 400 && response.code() < 500 && response.code() != 408) {
                     throw new Rejected(message);
@@ -195,10 +203,12 @@ final class HostClient {
             JSONObject module = modules.getJSONObject(i);
             if (!"cockpit-speech".equals(module.optString("id"))) continue;
             String path = module.getString("apiBase");
-            if (!path.matches("/_modules/cockpit-speech/[a-f0-9]{64}/api")) {
-                throw new IOException("Speech 模块发现返回了无效路径");
+            String digest = module.optString("digest", "");
+            if (!digest.matches("[a-f0-9]{64}")
+                    || !path.equals("/_modules/cockpit-speech/" + digest + "/api")) {
+                throw new IOException("Speech 模块发现返回了无效或不匹配的版本路径");
             }
-            return request(path + "/session", new JSONObject());
+            return request(path + "/session", new JSONObject(), digest);
         }
         throw new Rejected("目标 Cockpit 未启用 Speech；未上传录音");
     }

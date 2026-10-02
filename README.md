@@ -51,16 +51,20 @@ The app defaults to HTTPS and saves the address locally; no personal host is
 bundled in the source or APK. Select **Save and sign in with QR**, scan with a
 phone and approve with its existing Passkey, then use
 up/down and confirm on the remote to select a session. No session ID typing is
-required. The directory includes all sessions
-regardless of role, loaded state or status; it does not auto-select an Assistant
-session. Titles, working directories and IDs distinguish similarly named entries.
-Next/previous page controls expose the full directory in bounded pages. Listing
+required. The chooser only displays sessions whose configured `roles` include an
+exact `roleId: "assistant"`, regardless of module ID, loaded state or status.
+Missing roles, `appliedRoles` alone, display names and assistant-authored messages
+do not qualify. There is no show-all option or automatic session selection.
+Titles, working directories and IDs distinguish similarly named entries.
+Next/previous controls traverse bounded directory pages; filtering can leave a
+page empty, so use the next-page button when offered. Listing
 does not load sessions or read their chats. A changed catalog invalidates its
 cursor; explicitly refresh rather than silently skipping entries.
 
 The selected session and login are saved encrypted and reused after restarting.
 Use **Choose session** in the menu to change it. Resolve/discard a draft or an
 uncertain send before switching; old text must never move to another destination.
+The filter does not replace a saved selection or confer session access permission.
 **Advanced connection settings** optionally changes the HTTPS root and gateway
 `Authorization` (`Basic ...` or `Bearer ...`, not the GitHub/Copilot token).
 Changing the site clears the old selection and all old credentials (device tokens,
@@ -125,7 +129,7 @@ drafts/UNKNOWN allow reauthentication only, not a host/session switch.
 The v1 gateway defaults are a 300-second device code, 900-second access token
 and a device-family absolute maximum of 30 days; activity/rotation cannot extend
 that server maximum. This is **host-access authorization**, not per-session
-permission isolation. The directory continues to include all sessions. A successful
+permission isolation. The chooser filters configured assistant roles locally. A successful
 login opens selection when there is no draft, otherwise retains the original target.
 Existing manually configured Authorization/native cookies are replaced only after
 successful device login; a failed attempt leaves them intact.
@@ -218,6 +222,12 @@ cannot retract the original operation. No host-side idempotency layer is added.
 
 Speech is discovered through `/_modules`: its digest-bound `apiBase` is validated
 as same-origin and used for `POST /session` with `{}`. No digest is hardcoded.
+Speech credential requests bind the discovered `digest` to its exact `apiBase`
+and send `X-Cockpit-Module-Digest` on that module POST only. A module HTTP 409
+is reported as a module request conflict, not as expired gateway authentication.
+The next explicit recording attempt discovers the module again; requests and
+recordings are never automatically replayed on a conflict.
+
 Audio is then sent directly to the approved Azure endpoint using its short-lived
 credential; the Cockpit gateway credential is never forwarded to Azure.
 
@@ -250,6 +260,17 @@ assets. It validates bounded sizes, SHA-256, package name, increasing integer
 version code, version name, minimum SDK and the exact installed single signing
 certificate. Signing rotation and downgrades are not supported. Public GitHub
 traffic has a separate client and carries no Cockpit credentials.
+
+Failures display a fixed stage/reason code and relevant numeric facts on screen,
+and write the same sanitized diagnostic under the Android log tag
+`DashboardUpdater`. Stages distinguish release/manifest requests, APK download
+and storage, file hash/size, package parsing, version/minimum API, installed/APK
+signers, and launching system settings or the installer. The diagnostic includes
+the device's Android API and target version code when known; HTTP failures include
+the status code. Photograph the message for troubleshooting; ADB is not required.
+Logs omit response bodies, URLs, credentials, exception text and stack traces.
+Cancellation does not emit a late failure log. These diagnostics do not establish
+the cause of a previously observed device failure.
 
 Confirm downloading, then confirm opening Android's installer. Android 8+ may
 first require allowing this app to install unknown apps; returning from settings

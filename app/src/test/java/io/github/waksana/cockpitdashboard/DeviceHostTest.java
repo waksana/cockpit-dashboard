@@ -67,6 +67,31 @@ public class DeviceHostTest {
                 + "\"token_type\":\"Bearer\",\"expires_in\":900,\"scope\":\"host-access\"}");
     }
 
+    @Test public void speechDigestCoexistsWithDeviceBearerAndLegacyGateCookie() throws Exception {
+        String digest = "a".repeat(64);
+        String path = "/_modules/cockpit-speech/" + digest + "/api";
+        GateSession gateSession = new GateSession(server.url("/").toString(), "A".repeat(43),
+                System.currentTimeMillis() + 60000);
+        for (boolean useDevice : new boolean[]{true, false}) {
+            HostClient client = useDevice ? client(900)
+                    : new HostClient(server.url("/"), "session", "Basic synthetic", http, gateSession);
+            server.enqueue(new MockResponse().setBody("{\"modules\":[{\"id\":\"cockpit-speech\","
+                    + "\"digest\":\"" + digest + "\",\"apiBase\":\"" + path + "\"}]}"));
+            server.enqueue(new MockResponse().setBody("{\"clientSecret\":\"synthetic\"}"));
+            client.speechCredential();
+            RecordedRequest discovery = server.takeRequest();
+            RecordedRequest credential = server.takeRequest();
+            String authorization = useDevice ? "Bearer synthetic-access" : "Basic synthetic";
+            assertEquals(authorization, discovery.getHeader("Authorization"));
+            assertEquals(authorization, credential.getHeader("Authorization"));
+            String cookie = useDevice ? null : GateSession.COOKIE + "=" + "A".repeat(43);
+            assertEquals(cookie, discovery.getHeader("Cookie"));
+            assertEquals(cookie, credential.getHeader("Cookie"));
+            assertNull(discovery.getHeader("X-Cockpit-Module-Digest"));
+            assertEquals(digest, credential.getHeader("X-Cockpit-Module-Digest"));
+        }
+    }
+
     @Test public void bearerOverridesLegacyOnlyOnHostRequestsAndNeverContaminatesTransport() throws Exception {
         HostClient client = client(900);
         server.enqueue(new MockResponse().setBody("{\"ok\":true}"));

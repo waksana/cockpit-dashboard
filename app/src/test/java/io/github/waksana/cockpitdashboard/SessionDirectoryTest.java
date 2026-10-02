@@ -33,19 +33,34 @@ public class SessionDirectoryTest {
         return new JSONObject().put("sessionId", id).put("title", title).put("cwd", "/project");
     }
 
-    @Test public void directoryPreservesAllRolesAndStatusesAndDuplicateTitles() throws Exception {
+    private JSONArray assistantRoles() throws JSONException {
+        return new JSONArray().put(new JSONObject().put("moduleId", "assistant").put("roleId", "assistant"));
+    }
+
+    @Test public void directoryFiltersConfiguredAssistantRoleNotAppliedRoleNameOrStatus() throws Exception {
         JSONArray rows = new JSONArray().put(entry("ordinary", "Same").put("roles", new JSONArray()))
-                .put(entry("assistant", "Same").put("roles", new JSONArray().put(
-                        new JSONObject().put("moduleId", "assistant").put("roleId", "assistant"))))
-                .put(entry("unloaded", "").put("loaded", false))
-                .put(entry("error", "Error").put("status", "error"));
+                .put(entry("assistant", "Same").put("roles", assistantRoles()))
+                .put(entry("unloaded", "").put("loaded", false).put("roles", assistantRoles()))
+                .put(entry("error", "Same").put("status", "error").put("roles", assistantRoles()))
+                .put(entry("applied-only", "Assistant").put("appliedRoles", assistantRoles()))
+                .put(entry("missing", "Assistant"))
+                .put(entry("name-only", "Assistant").put("roles", new JSONArray().put(
+                        new JSONObject().put("moduleId", "assistant").put("roleId", "node").put("name", "assistant"))))
+                .put(entry("substring", "Assistant").put("roles", new JSONArray().put(
+                        new JSONObject().put("roleId", "assistant-extra"))))
+                .put(entry("configured", "Same").put("rolesNeedReload", true)
+                        .put("appliedRoles", new JSONArray()).put("roles", new JSONArray()
+                                .put(new JSONObject().put("moduleId", "other").put("roleId", "node"))
+                                .put(new JSONObject().put("moduleId", "another").put("roleId", "assistant"))));
         SessionDirectory page = new SessionDirectory(new JSONObject().put("sessions", rows).put("cursor", "opaque"));
         assertEquals(4, page.entries.size());
-        assertEquals("ordinary", page.entries.get(0).id);
-        assertEquals("assistant", page.entries.get(1).id);
-        assertNotEquals(page.entries.get(0).label("ordinary"), page.entries.get(1).label("ordinary"));
-        assertTrue(page.entries.get(0).label("ordinary").startsWith("✓"));
-        assertTrue(page.entries.get(2).label("").contains("未命名会话"));
+        assertEquals("assistant", page.entries.get(0).id);
+        assertEquals("unloaded", page.entries.get(1).id);
+        assertEquals("error", page.entries.get(2).id);
+        assertEquals("configured", page.entries.get(3).id);
+        assertNotEquals(page.entries.get(0).label("assistant"), page.entries.get(2).label("assistant"));
+        assertTrue(page.entries.get(0).label("assistant").startsWith("✓"));
+        assertTrue(page.entries.get(1).label("").contains("未命名会话"));
         assertEquals("opaque", page.next);
     }
 
@@ -59,6 +74,11 @@ public class SessionDirectoryTest {
                 new JSONArray().put(entry("bad/id", "A")))));
         assertThrows(JSONException.class, () -> new SessionDirectory(new JSONObject().put("sessions",
                 new JSONArray()).put("cursor", "")));
+        for (Object malformed : new Object[]{JSONObject.NULL, "assistant",
+                new JSONArray().put("assistant"), new JSONArray().put(new JSONObject())}) {
+            assertThrows(JSONException.class, () -> new SessionDirectory(new JSONObject().put("sessions",
+                    new JSONArray().put(entry("id", "A").put("roles", malformed)))));
+        }
     }
 
     @Test public void directoryUsesOnlyPassiveBoundedEndpointWithOpaqueContinuation() throws Exception {
@@ -67,9 +87,14 @@ public class SessionDirectoryTest {
             HostClient client = new HostClient(server.url("/"), "", "", new OkHttpClient());
             server.enqueue(new MockResponse().setBody(new JSONObject().put("sessions",
                     new JSONArray().put(entry("pick-me", "Hello"))).put("cursor", "next").toString()));
-            server.enqueue(new MockResponse().setBody("{\"sessions\":[]}"));
-            assertEquals("next", client.directory(null).next);
-            assertNull(client.directory("next").next);
+            server.enqueue(new MockResponse().setBody(new JSONObject().put("sessions", new JSONArray()
+                    .put(entry("assistant", "Match").put("roles", assistantRoles()))).toString()));
+            SessionDirectory firstPage = client.directory(null);
+            assertTrue(firstPage.entries.isEmpty());
+            assertEquals("next", firstPage.next);
+            SessionDirectory nextPage = client.directory("next");
+            assertEquals("assistant", nextPage.entries.get(0).id);
+            assertNull(nextPage.next);
             RecordedRequest first = server.takeRequest(), second = server.takeRequest();
             assertEquals("/intent/session/directory", first.getPath());
             assertEquals("/intent/session/directory", second.getPath());
@@ -86,6 +111,29 @@ public class SessionDirectoryTest {
         Field field = MainActivity.class.getDeclaredField(name);
         field.setAccessible(true);
         return field.get(activity);
+    }
+
+    @Test public void filteredEmptyPageKeepsNextPageAndExplainsAssistantFilter() throws Exception {
+        try (ActivityController<MainActivity> controller = Robolectric.buildActivity(MainActivity.class).create()) {
+            MainActivity activity = controller.get();
+            Field foreground = MainActivity.class.getDeclaredField("foreground");
+            foreground.setAccessible(true);
+            foreground.set(activity, true);
+            SessionDirectory page = new SessionDirectory(new JSONObject().put("sessions",
+                    new JSONArray().put(entry("hidden", "Not assistant"))).put("cursor", "next"));
+            Method show = MainActivity.class.getDeclaredMethod("showDirectory",
+                    SessionDirectory.class, java.util.List.class, String.class);
+            show.setAccessible(true);
+            show.invoke(activity, page, new java.util.ArrayList<String>(), null);
+            AlertDialog dialog = ShadowAlertDialog.getLatestAlertDialog();
+            assertTrue(shadowOf(dialog).getTitle().toString().contains("assistant"));
+            assertTrue(shadowOf(dialog).getMessage().toString().contains("下一页"));
+            assertEquals("下一页", dialog.getButton(AlertDialog.BUTTON_POSITIVE).getText().toString());
+            assertEquals(View.VISIBLE, dialog.getButton(AlertDialog.BUTTON_POSITIVE).getVisibility());
+            assertFalse(((JSONObject) get(activity, "settings")).has("sessionId"));
+            activity.onPause();
+            shadowOf(Looper.getMainLooper()).idle();
+        }
     }
 
     private boolean hasInput(View view) {
